@@ -49,9 +49,12 @@ only the power stage (below) differs.
 | Small 5V submersible pump | The common "3–6V mini submersible pump" hobby part, run at 5V. Low flow, which is actually right for drip-watering a single plant. |
 | Logic-level N-channel MOSFET (e.g. AO3400 or IRLZ44N) | Low-side switch between pump's negative terminal and ground. Gate driven from a GPIO through a ~100Ω series resistor; add a 10kΩ pull-down gate-to-ground so the pump can't twitch on during MCU boot/reset. |
 | Flyback diode (1N5819 Schottky or 1N4148) | Across the pump terminals, to absorb the inductive kick when the MOSFET switches off. Motors are inductive loads — skip this and you'll eventually kill a MOSFET. |
-| INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead/reservoir dry if using a pump that stalls dry) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. Doubles as a secondary dry-run diagnostic alongside the float switch below. |
-| Mini float switch (vertical or horizontal, normally-open) | Mounted at the "near-empty" level inside the reservoir, wired to a GPIO (with pull-up/pull-down as appropriate for the switch type). This is the primary, hardware-only dry-run safety cutoff — checked every wake cycle before the pump is ever commanded on, independent of the hub, network, or the volume-tracking estimate. |
+| INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. Also a secondary diagnostic for faults the reservoir monitor's float switch can't catch (e.g. clogged tubing). |
 | Reserved I2C header pads | Not populated yet — for the Phase 2 humidity/temperature sensor (e.g. SHT31). Leaving the header now avoids a board respin later. |
+
+Note: no float switch on the pump satellite itself — reservoirs are shared
+across satellites, so level sensing lives on a separate **reservoir
+monitor** node instead (below), one per physical container.
 
 ## Satellite — outlet-powered variant
 
@@ -71,6 +74,18 @@ For satellites out of outlet reach.
 | Small 6V solar panel (1–2W) | Trickle-charges the LiPo. |
 | Solar-capable LiPo charge controller (e.g. board built around MCP73871 or BQ24074) | Important: **not** a plain TP4056 — those expect a regulated 5V USB input, not a variable-voltage solar panel, and won't charge reliably or safely off solar without that regulation. |
 | Small boost converter module (LiPo → 5V) | Produces the same clean 5V rail as the outlet variant, so the rest of the satellite circuit (MCU, MOSFET, pump) doesn't need to know or care which power variant it's on. |
+
+## Reservoir monitor — common parts
+
+One per physical container, regardless of how many pump satellites draw
+from it. No pump/MOSFET/current-sensing — it senses and reports, nothing
+else. Uses the same outlet or solar/battery power-stage options as the pump
+satellite (above), whichever fits where the container lives.
+
+| Part | Notes |
+|---|---|
+| ESP32-C3 mini dev board | Same board family as the pump satellite, for one firmware/tooling setup across both node types. |
+| Mini float switch (vertical or horizontal, normally-open) | Mounted at the "near-empty" level inside the reservoir, wired to a GPIO (with pull-up/pull-down as appropriate for the switch type). This is the primary, hardware-only dry-run safety cutoff. Mechanical mounting (bracket, enclosure) is a DIY/3D-print detail per container shape — not a fixed part spec. |
 
 ## Open items to settle before ordering
 

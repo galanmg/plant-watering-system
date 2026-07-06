@@ -5,143 +5,175 @@ get made — treat "Open questions" as the running to-do list.
 
 ## Overview
 
+Three node types: the hub, pump satellites, and reservoir monitors. A
+reservoir can be shared by several pump satellites; it's watched by exactly
+one reservoir monitor, independent of how many pumps draw from it.
+
 ```
                     ┌─────────────────────┐
                     │         Hub         │
                     │  ESP32 + web server │
-                    │  hosts WiFi + UI     │
                     └──────────┬──────────┘
                                │ wireless
-              ┌────────────────┼────────────────┐
-              │                │                │
-        ┌─────▼─────┐    ┌─────▼─────┐    ┌─────▼─────┐
-        │  Pump      │    │  Pump      │    │  Pump      │
-        │  module 1  │    │  module 2  │    │  module N  │
-        └────────────┘    └────────────┘    └────────────┘
+        ┌──────────────┬───────┴───────┬──────────────┐
+        │               │               │              │
+  ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐  ┌──────▼──────┐
+  │  Pump      │   │  Pump      │   │  Pump      │  │  Reservoir  │
+  │  satellite │   │  satellite │   │  satellite │  │  monitor    │
+  │  A         │   │  B         │   │  C         │  │  (tank 1)   │
+  └─────┬──────┘   └─────┬──────┘   └────────────┘  └──────┬──────┘
+        │                │                                  │
+        └───────draws from tank 1───────┘          watches level of tank 1
 ```
 
 ## Hub
 
 - Hardware: ESP32 (WROOM or similar dev board), always powered (plugged in).
-- Runs in **AP+STA mode simultaneously**: hosts its own AP (so the local web
-  UI is always reachable even if home WiFi is down) while also joining the
-  home WiFi as a station, purely to get an upstream path to the internet for
-  the remote-access relay (below). Local UI doesn't depend on the home
-  network; remote access does.
+- **v1 network mode: joins home WiFi as a station**, reachable at a normal
+  LAN address (mDNS hostname, e.g. `plant-hub.local`, so no need to hunt for
+  an IP). No separate AP for now — simpler to build, and since remote access
+  (below) is coming later and needs an internet path anyway, starting on
+  home WiFi means adding that later doesn't require a network-mode change.
+  Trade-off accepted: if home WiFi is down, the local status page is briefly
+  unreachable too — acceptable since dry-run safety doesn't depend on the
+  hub anyway (see Dry-run protection).
 - Local web server (ESPAsyncWebServer is the usual choice) serving:
-  - Status page: which satellites are online/detected, last-seen time,
-    battery level, reservoir level / days-until-empty per satellite.
+  - Status page: which pump satellites and reservoir monitors are online,
+    last-seen time, battery level, reservoir level / days-until-empty.
   - Schedule page: view/edit per-satellite watering schedule, rename
-    satellites, global on/off.
-  - Simple REST-ish endpoints so satellites can report in and pull their
-    schedule.
-- Persists schedule, satellite registry (names, reservoir capacities), and
-  watering log to flash (e.g. LittleFS/SPIFFS + JSON, or NVS) so a power
-  cycle doesn't lose state.
+    satellites and reservoirs, global on/off.
+  - Simple REST-ish endpoints so satellites/monitors can report in and pull
+    their schedule/config.
+- Persists schedule, satellite/reservoir registry (names, which satellites
+  draw from which reservoir, reservoir capacities), and the watering log to
+  flash (e.g. LittleFS/SPIFFS + JSON, or NVS) so a power cycle doesn't lose
+  state.
 
-## Pump modules ("satellites")
+## Pump satellites
 
-- Hardware per module: ESP32 (or a cheaper ESP32-C3 if cost/size matters) +
-  MOSFET or relay driving a small submersible/peristaltic pump + battery.
-- Most modules will be battery powered and placed wherever the plant is, not
-  next to an outlet — this drives most of the design constraints below.
-- Each satellite is identified by a stable ID (its MAC address) and given a
-  human-friendly name in the hub UI once it's fixed to a specific plant
-  (e.g. "Fern — living room"). Renaming is purely a hub-side registry edit;
-  the satellite itself doesn't need to know its own name.
-- Behavior (Phase 1): wake up on a timer, check the float switch (below)
-  before doing anything else, run the pump for a scheduled duration if it's
-  due *and* the reservoir isn't flagged empty, check in with the hub with
-  status (ran / skipped-empty / reservoir level, if using volume tracking),
-  go back to deep sleep.
-- Behavior (Phase 2 addition): also read humidity/temperature sensor(s) before
-  deciding how much to water, and report readings to the hub for the status
-  page.
+- Hardware per satellite: ESP32-C3 + MOSFET or relay driving a small
+  submersible/peristaltic pump + power stage (outlet or solar/battery — see
+  [hardware.md](hardware.md)). No float switch on the pump satellite itself —
+  reservoir level is the monitor's job (below), since a reservoir can be
+  shared by several pump satellites.
+- Each satellite is identified by a stable ID (its MAC address), assigned to
+  a reservoir (which one it draws from), and given a human-friendly name in
+  the hub UI once it's fixed to a specific plant (e.g. "Fern — living
+  room"). Naming/assignment is purely a hub-side registry edit; the
+  satellite itself doesn't need to know either.
+- Behavior (Phase 1): wake up on a timer, ask the hub (or, see open question
+  below, listen directly) whether its assigned reservoir is currently known
+  non-empty and that status is fresh; if so and watering is due, run the
+  pump for the scheduled duration; report status (ran / skipped-empty /
+  skipped-stale) back to the hub; go back to deep sleep.
+- Behavior (Phase 2 addition): also read humidity/temperature sensor(s)
+  before deciding how much to water, and report readings to the hub.
+
+## Reservoir monitors
+
+Auxiliary, pump-less nodes: one per physical container, regardless of how
+many pump satellites draw from it. Deliberately minimal and DIY-friendly —
+just enough electronics to sense a level and report it, with the mechanical
+mounting (float switch bracket, enclosure) left as a build/3D-print detail
+per container shape, not a fixed part spec.
+
+- Hardware: ESP32-C3 + a float switch at the "near-empty" level + a power
+  stage (outlet or battery — no pump/MOSFET/current-sensing needed here,
+  since it drives nothing). See [hardware.md](hardware.md).
+- Behavior: wake on a timer *more often than pump satellites typically
+  water* (e.g. every 30–60 minutes — level changes slowly, and checking a
+  switch + reporting is cheap), read the float switch, report
+  `reservoir_id`, empty/not-empty, timestamp, back to the hub. Sleep.
+- Identified by MAC, assigned a human-friendly reservoir name and capacity
+  in the hub UI (e.g. "Kitchen jerrycan — 8 L").
+- A reservoir can have multiple pump satellites pointed at it; it has
+  exactly one monitor.
 
 ## Dry-run protection
 
 Cheap submersible pumps aren't rated to run dry — the motor relies on the
-water for cooling/lubrication, so an empty reservoir can burn one out. Three
-layers, each solving a different part of the problem:
+water for cooling/lubrication, so an empty reservoir can burn one out.
+Splitting monitoring from pumping (previous section) means the pump
+satellite can no longer read a float switch on its own board — the "empty"
+signal now necessarily crosses a wireless hop. Layers, in order of how much
+they can be trusted:
 
-1. **Float switch (safety-critical, hardware)** — a physical float switch at
-   the "near-empty" level in the reservoir, wired straight into a GPIO. The
-   satellite checks it *before* commanding the pump on, every wake cycle,
-   independent of the hub or any network round-trip. This is the actual
-   safety net — it works even if the hub is down, the WiFi is down, or the
-   volume-tracking math below is wrong.
-2. **Current sensing (diagnostic)** — the INA219 already planned for "pump
-   detected" (see [hardware.md](hardware.md)) doubles as a dry-run check: a
-   submersible pump draws a different current signature dry vs. primed with
-   water. Lets the satellite catch subtler faults the float switch can't
-   (e.g. clogged tubing keeping the float from ever reporting empty, or a
-   partially-primed pump). Signature needs validating empirically once we
-   have a real pump to test.
-3. **Volume tracking (convenience, software)** — see below. This is a "fuel
-   gauge" for planning ahead, not a safety mechanism — it's only as accurate
-   as the pump's nominal flow rate, so it shouldn't be the only thing
-   standing between the pump and running dry.
+1. **Float switch on the reservoir monitor (hardware)** — the actual sensing
+   is still a dumb physical switch, as reliable as before. What's changed is
+   *who* has it: the monitor, not the pump satellite.
+2. **Freshness/fail-safe default (critical, software)** — because the empty
+   signal now has to travel over the network to reach the pump satellite, a
+   pump satellite must treat a *stale* reservoir status (monitor hasn't
+   reported in longer than expected, hub unreachable, etc.) the same as
+   "empty": **default to skipping the watering, not running it**, whenever
+   it can't confirm a recent non-empty reading. This preserves a fail-safe
+   posture despite no longer being a same-board GPIO read.
+3. **Current sensing (diagnostic, on the pump satellite)** — the INA219
+   already planned for "pump detected" (see [hardware.md](hardware.md))
+   catches faults the float switch can't, like clogged tubing that starves
+   flow even though the reservoir itself isn't empty.
+4. **Volume tracking (convenience, software)** — see below. A "fuel gauge"
+   for planning ahead, not a safety mechanism.
+
+Open implementation question: should a pump satellite get the reservoir's
+status only via the hub (simpler — one request per wake, pulls schedule +
+reservoir status together), or listen directly for the monitor's periodic
+broadcast when in range (more resilient — still works during a brief hub
+outage, at the cost of satellites needing to know which monitor's ID to
+listen for)? Leaning towards starting with the hub-mediated version for
+simplicity, given the freshness fail-safe already covers the "hub is down"
+case safely (it just waters less eagerly, never unsafely).
 
 ## Reservoir tracking & logging
 
-- Each satellite has a configured **reservoir capacity** (e.g. 8000 mL),
-  editable in the hub UI, alongside its name.
+- Each reservoir (not each satellite — reservoirs can be shared) has a
+  configured **capacity** (e.g. 8000 mL) and name, editable in the hub UI.
 - The hub keeps a running **cumulative volume dispensed since last refill**
-  per satellite: each watering event adds `duration_run × pump's nominal
-  flow rate (mL/s at 5V)` to the total. This is an estimate (no flow sensor
-  in the current plan), not a precise measurement — flags for the "days
-  left" number to be treated as an approximation.
-- A **"refill" action** in the hub UI resets a satellite's cumulative
-  dispensed total to zero (user presses it after physically topping up the
-  container).
-- **Days-until-empty** is computed by projecting the *upcoming* schedule
-  forward against remaining volume (`(capacity - dispensed) / scheduled
-  mL-per-day`), rather than only averaging past usage — this gives a
+  per reservoir: every watering event from *any* satellite drawing on that
+  reservoir adds `duration_run × that pump's nominal flow rate (mL/s at
+  5V)` to the reservoir's total. Estimate, not a precise measurement (no
+  flow sensor in the current plan) — the "days left" number is an
+  approximation.
+- A **"refill" action** in the hub UI resets a reservoir's cumulative
+  dispensed total to zero.
+- **Days-until-empty** per reservoir is computed by projecting the
+  *upcoming* schedule of every satellite attached to it forward against
+  remaining volume, rather than only averaging past usage — gives a
   sensible number immediately after a refill, before any history exists.
-  Historical actual-vs-expected volume (once current sensing or a future
-  flow sensor gives real data) can later be used to calibrate the nominal
-  flow rate per pump, improving the estimate over time.
-- The hub logs every watering event (satellite, timestamp, duration,
-  estimated volume, ran/skipped-empty outcome) to flash. Given flash size
-  is limited, plan to keep fine-grained events for a rolling window (e.g.
-  last 30 days) and collapse older entries into daily totals — full-detail
-  history beyond that lives in the remote relay's storage instead (below),
-  if remote access is in place.
+- **Log retention: 45 days, then deleted.** The hub logs every watering
+  event (satellite, reservoir, timestamp, duration, estimated volume,
+  outcome) to flash; entries older than 45 days are purged outright — no
+  cloud offload, no rolling summarization, since remote access (below) is
+  deferred and there's no second place to keep them anyway. Revisit sizing
+  once we know actual event volume and flash headroom on the real board.
 
-## Remote access
+## Remote access (deferred — design kept for later, not being built now)
 
-Decision: **outbound relay**, not direct port-forwarding. The hub makes an
-outbound connection to a small always-on relay rather than accepting inbound
-connections from the internet — this avoids opening a port on the home
-router (no direct internet exposure of the hub itself) and works regardless
-of ISP CGNAT.
+Not a v1 requirement — the near-term goal is getting the local system
+(hub + satellites + monitors, on home WiFi) working first. Keeping the
+design here so the *local* system is built in a way that doesn't have to
+be reworked when this gets added:
 
-- Hub connects out (over its home-WiFi STA link) to a small relay — most
-  likely **MQTT over TLS** to either a self-hosted broker on a cheap VPS
-  (~$5/mo, full control, e.g. Mosquitto) or a managed free-tier broker (e.g.
-  HiveMQ Cloud) to start with zero infrastructure to maintain.
-- Hub **publishes**: satellite statuses, watering log events, reservoir
-  levels/empty flags. Hub **subscribes**: schedule changes, on/off/refill
-  commands issued remotely.
-- A small always-on companion service on the relay side (if self-hosting)
-  subscribes to the hub's topics and appends events to a local database
-  (SQLite is plenty at this scale) — this is what gives durable history
-  beyond the hub's own flash storage, and is what a remote dashboard
-  (a simple web page, could even be an MQTT-over-websockets client talking
-  to the broker directly for live state) reads from.
-- Security: unique credentials (or client cert) per hub on the broker, TLS
-  throughout, and the command topic requires the same authenticated
-  connection — so nobody but the household can issue watering commands.
-- A natural extension once this exists: push a notification (e.g. via
-  ntfy.sh, Pushover, or a transactional email) when a reservoir goes empty,
-  rather than requiring an active check of the dashboard while away.
-- This is a second software component beyond the hub/satellite firmware —
-  worth its own directory in the repo once we get here (not yet).
+- Decision when we do build it: **outbound relay**, not direct
+  port-forwarding. The hub makes an outbound connection to a small
+  always-on relay rather than accepting inbound internet connections — no
+  port opened on the home router, works regardless of ISP CGNAT.
+- Hub already being WiFi-station-connected in v1 (see Hub section) means
+  this can be added later as a new outbound client (e.g. MQTT over TLS to a
+  self-hosted broker on a cheap VPS, or a managed free-tier broker) without
+  touching the hub's network mode.
+- Hub would publish satellite/reservoir statuses and log events, and
+  subscribe to remotely-issued schedule/command changes. A relay-side
+  companion service would persist history to its own database and serve a
+  remote dashboard — none of which needs to exist until this phase starts.
+- Security when built: unique credentials/cert per hub, TLS throughout,
+  authenticated command topic.
 
-## Communication: hub ↔ modules
+## Communication: hub ↔ satellites/monitors
 
-This is the biggest open decision. Options, given the hub needs to host its
-own WiFi + web UI and modules are likely battery powered:
+This is the biggest open decision. Applies to both pump satellites and
+reservoir monitors — same link, same trade-offs. Options, given the hub
+needs to host its own WiFi + web UI and battery-powered nodes are the norm:
 
 | Option | Pros | Cons |
 |---|---|---|
@@ -149,16 +181,16 @@ own WiFi + web UI and modules are likely battery powered:
 | **ESP-NOW** (connectionless, low-power peer-to-peer WiFi protocol) | Very low power, fast wake-send-sleep cycle (~ms), no association overhead, good range for line-of-sight | No native multi-hop/relay (would need to hand-roll if range is an issue); hub needs a small bridge layer between ESP-NOW and the web UI |
 | **MQTT over WiFi** (modules publish to a broker, e.g. running on the hub) | Clean pub/sub model, easy to extend, good tooling | Same WiFi power cost as option 1, plus a broker to run on the hub |
 
-Leaning towards **ESP-NOW** for the module→hub link given battery life matters
-more than protocol elegance, with the hub bridging ESP-NOW messages into its
-own web UI/state. Worth prototyping both ESP-NOW and plain WiFi+deep-sleep
-power draw before committing, though.
+Leaning towards **ESP-NOW** given battery life matters more than protocol
+elegance, with the hub bridging ESP-NOW messages into its own web UI/state.
+Worth prototyping both ESP-NOW and plain WiFi+deep-sleep power draw before
+committing, though.
 
 ## Open questions
 
-- [x] Hub network mode: resolved as **AP+STA simultaneously** — own AP for a
-      home-WiFi-independent local UI, plus a home-WiFi station link purely
-      to reach the internet relay. See Remote access section.
+- [x] Hub network mode: **joins home WiFi (station only)** for v1, reachable
+      via mDNS. No AP for now — see Hub section for why, and how this sets
+      up remote access later without a rework.
 - [x] Module power source: outlet-powered where possible, solar+LiPo where
       not — see [hardware.md](hardware.md), both variants regulated to a
       common 5V rail so the rest of the circuit is power-source-agnostic.
@@ -167,17 +199,19 @@ power draw before committing, though.
       satellite can tell the hub "commanded on but drew ~0mA" vs. "drew
       expected current," not just a heartbeat. Still open whether this is
       in scope for v1 or deferred (see hardware.md's open items).
-- [ ] Water source per module: individual small reservoir per module (needs
-      refilling before vacation) vs. tubing from a central reservoir/tank?
-      Reservoir tracking section above assumes one reservoir per satellite —
-      revisit if a shared tank is preferred instead.
+- [x] Water source per module: **resolved as shared reservoirs**, decoupled
+      from pump satellites via dedicated reservoir monitors — see Reservoir
+      monitors section. A reservoir can feed multiple pump satellites.
 - [ ] Range: how far are the farthest plants from where the hub would live?
       Determines whether ESP-NOW range is sufficient or a relay module is
       needed.
-- [x] Remote access while on vacation: resolved as an outbound relay
-      (MQTT-over-TLS to a small VPS or managed broker) — see Remote access
-      section. Open sub-decision: self-hosted VPS vs. managed free-tier
-      broker to start.
+- [ ] Reservoir status delivery to pump satellites: via the hub only, or
+      also direct monitor→satellite broadcast for resilience? See open
+      question at the end of Dry-run protection.
+- [x] Remote access while on vacation: **deferred** — design kept in the
+      Remote access section for later, not being built in v1. Local system
+      built so adding it later doesn't require rework (hub already on WiFi
+      station mode).
 
 ## Phase 2 (later): sensing
 
