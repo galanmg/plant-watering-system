@@ -112,18 +112,16 @@ last-known status of everything (see Hub section).
   always-on display.
 - **Color = role**: green for pump satellites, blue for monitor satellites.
 - **Fixed/solid = working as intended.** **Blinking = needs attention.**
-  Concretely, "needs attention" means: the hub hasn't had a fresh check-in
-  from that satellite within its expected window (offline), *or* its last
-  report included a fault (e.g. a pump's `aborted-dry` outcome, an INA219
-  reading of "commanded on, drew ~0mA", a monitor stuck reporting the same
-  value past its own staleness window).
-  - Open call, easy to change later: should a pump satellite's LED also
-    blink when it correctly *skipped* watering because its reservoir is
-    flagged empty? That's not a malfunction, but it's arguably the most
-    useful thing to catch in a 5-second glance before leaving for a trip.
-    Leaning towards yes — blink for "needs attention" in the broad sense,
-    not strictly "broken" — but worth confirming once the panel actually
-    exists.
+  Concretely, "needs attention" means any of:
+  - the hub hasn't had a fresh check-in from that satellite within its
+    expected window (offline);
+  - its last report included a fault (a pump's `aborted-dry` outcome, an
+    INA219 reading of "commanded on, drew ~0mA", a monitor stuck reporting
+    the same value past its own staleness window);
+  - a pump satellite correctly *skipped* watering because its reservoir is
+    flagged empty. Not a malfunction, but it's exactly the kind of thing a
+    5-second glance before leaving for a trip should catch — so it blinks
+    too, same as an actual fault.
 - **Which LED maps to which satellite is a hub-registry setting** (an "LED
   slot" field alongside a satellite's name), not automatic/first-come — so
   if there are ever more than 10 satellites, whichever ones matter most get

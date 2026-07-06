@@ -109,6 +109,3 @@ satellite (above), whichever fits where the container lives.
       jerrycan vs. a wide bucket need different switch geometry/orientation)
       — pick per-container once actual containers are chosen, not a single
       universal part.
-- [ ] Whether a pump satellite's LED should also blink for a correct
-      empty-reservoir skip, not just an actual fault — see the open call in
-      architecture.md's Status LEDs section.
