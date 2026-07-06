@@ -38,7 +38,7 @@ range.
 ESP32-WROOM-32U (u.FL connector) + external 2.4GHz antenna. Flagging now,
 not buying yet — no point until we know we need it.
 
-## Satellite (pump module) — common parts
+## Pump satellite — common parts
 
 Same "brains" board for both the outlet-powered and solar/battery variants;
 only the power stage (below) differs.
@@ -53,10 +53,10 @@ only the power stage (below) differs.
 | Reserved I2C header pads | Not populated yet — for the Phase 2 humidity/temperature sensor (e.g. SHT31). Leaving the header now avoids a board respin later. |
 
 Note: no float switch on the pump satellite itself — reservoirs are shared
-across satellites, so level sensing lives on a separate **reservoir
-monitor** node instead (below), one per physical container.
+across satellites, so level sensing lives on a separate **monitor
+satellite** instead (below), one per physical container.
 
-## Satellite — outlet-powered variant
+## Pump satellite — outlet-powered variant
 
 For satellites near an outlet (no battery hassle needed).
 
@@ -64,7 +64,7 @@ For satellites near an outlet (no battery hassle needed).
 |---|---|
 | 5V/1A USB wall adapter | Feeds the 5V rail directly — same rail powers both the ESP32-C3 and the pump (switched via the MOSFET). |
 
-## Satellite — solar/battery variant
+## Pump satellite — solar/battery variant
 
 For satellites out of outlet reach.
 
@@ -75,7 +75,7 @@ For satellites out of outlet reach.
 | Solar-capable LiPo charge controller (e.g. board built around MCP73871 or BQ24074) | Important: **not** a plain TP4056 — those expect a regulated 5V USB input, not a variable-voltage solar panel, and won't charge reliably or safely off solar without that regulation. |
 | Small boost converter module (LiPo → 5V) | Produces the same clean 5V rail as the outlet variant, so the rest of the satellite circuit (MCU, MOSFET, pump) doesn't need to know or care which power variant it's on. |
 
-## Reservoir monitor — common parts
+## Monitor satellite — common parts
 
 One per physical container, regardless of how many pump satellites draw
 from it. No pump/MOSFET/current-sensing — it senses and reports, nothing
