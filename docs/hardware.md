@@ -32,7 +32,9 @@ range.
 |---|---|
 | ESP32-WROOM-32 dev board | Regular ESP32, not the -C3 mini — hub needs to run AP + web server + (likely) ESP-NOW bridging simultaneously, so a bit more headroom is nice. Any common dev board (e.g. "ESP32 DevKitC" style) works. |
 | 5V/1A USB wall adapter + cable | Powers the board continuously via USB or the 5V pin. |
-| Small enclosure | Vented plastic project box; keep the antenna area clear of metal. |
+| 10-LED WS2812B (NeoPixel) strip/bar | Status panel — see [architecture.md](architecture.md)'s Status LEDs section. One GPIO data line + 5V + GND; color (green=pump, blue=monitor) and blink state are set entirely in firmware per LED, so the panel doesn't need rewiring if the pump/monitor mix changes. Driven from the same 5V rail as the rest of the hub. |
+| Momentary push button (+ pull-down/pull-up as wired) | The status button — press to light the LED panel for a few seconds. One GPIO, standard software debounce. |
+| Small enclosure | Vented plastic project box; keep the antenna area clear of metal, with the LED strip and button visible/accessible on the front face. |
 
 **If range testing shows the hub can't reach far satellites:** swap for an
 ESP32-WROOM-32U (u.FL connector) + external 2.4GHz antenna. Flagging now,
@@ -107,3 +109,6 @@ satellite (above), whichever fits where the container lives.
       jerrycan vs. a wide bucket need different switch geometry/orientation)
       — pick per-container once actual containers are chosen, not a single
       universal part.
+- [ ] Whether a pump satellite's LED should also blink for a correct
+      empty-reservoir skip, not just an actual fault — see the open call in
+      architecture.md's Status LEDs section.

@@ -99,6 +99,42 @@ locally beyond "do what the hub just told me."
   minutes — level changes slowly, and a switch read + report is cheap),
   report `reservoir_id` + empty/not-empty + timestamp to the hub, sleep.
 
+## Status LEDs
+
+A physical, at-a-glance status panel on the hub itself — no phone/browser
+needed for a quick check. Purely a hub-side feature; doesn't touch
+satellite hardware or firmware, since the hub already holds the
+last-known status of everything (see Hub section).
+
+- **Up to 10 LEDs**, one per satellite, plus a **momentary status button**.
+  Pressing the button lights the LEDs for a few seconds (e.g. 10s) showing
+  a snapshot of current status, then they turn back off — not an
+  always-on display.
+- **Color = role**: green for pump satellites, blue for monitor satellites.
+- **Fixed/solid = working as intended.** **Blinking = needs attention.**
+  Concretely, "needs attention" means: the hub hasn't had a fresh check-in
+  from that satellite within its expected window (offline), *or* its last
+  report included a fault (e.g. a pump's `aborted-dry` outcome, an INA219
+  reading of "commanded on, drew ~0mA", a monitor stuck reporting the same
+  value past its own staleness window).
+  - Open call, easy to change later: should a pump satellite's LED also
+    blink when it correctly *skipped* watering because its reservoir is
+    flagged empty? That's not a malfunction, but it's arguably the most
+    useful thing to catch in a 5-second glance before leaving for a trip.
+    Leaning towards yes — blink for "needs attention" in the broad sense,
+    not strictly "broken" — but worth confirming once the panel actually
+    exists.
+- **Which LED maps to which satellite is a hub-registry setting** (an "LED
+  slot" field alongside a satellite's name), not automatic/first-come — so
+  if there are ever more than 10 satellites, whichever ones matter most get
+  a physical LED and the rest are still visible on the web status page.
+- Hardware recommendation (see [hardware.md](hardware.md)): a single
+  10-LED **WS2812B addressable strip** on one GPIO data line, rather than
+  10 discrete LEDs on 10 GPIOs — color and blink state become entirely
+  software-defined per LED, so the green/blue split isn't wired in at
+  build time and can be rebalanced in software as the pump/monitor mix
+  changes.
+
 ## Dry-run protection
 
 Cheap submersible pumps aren't rated to run dry — the motor relies on the
