@@ -69,12 +69,14 @@ power draw before committing, though.
       home WiFi is down; joining home WiFi means you can check status from
       anywhere the phone already has WiFi/is on the same network, and enables
       remote-over-internet access later if wanted.
-- [ ] Module power source: battery only (what capacity, what recharge/replace
-      cadence), or small solar top-up for outdoor plants?
-- [ ] What does "pump detected" mean exactly — module presence/heartbeat, or
-      actually sensing that the pump moved water (current sense on the motor,
-      flow sensor, water level in reservoir)? Affects whether we need current
-      sensing hardware per module.
+- [x] Module power source: outlet-powered where possible, solar+LiPo where
+      not — see [hardware.md](hardware.md), both variants regulated to a
+      common 5V rail so the rest of the circuit is power-source-agnostic.
+- [x] What does "pump detected" mean exactly — draft answer in
+      [hardware.md](hardware.md): an inline INA219 current sensor, so the
+      satellite can tell the hub "commanded on but drew ~0mA" vs. "drew
+      expected current," not just a heartbeat. Still open whether this is
+      in scope for v1 or deferred (see hardware.md's open items).
 - [ ] Water source per module: individual small reservoir per module (needs
       refilling before vacation) vs. tubing from a central reservoir/tank?
 - [ ] Range: how far are the farthest plants from where the hub would live?
