@@ -27,5 +27,6 @@ current thinking and open questions.
 
 ## Roadmap
 
-1. **Phase 1** — hub + pump modules, manual schedule, status page.
+1. **Phase 1** — hub + pump modules, manual schedule, status page, dry-run
+   protection, reservoir/usage tracking, remote access via an outbound relay.
 2. **Phase 2** — humidity/temperature sensing, adaptive watering.

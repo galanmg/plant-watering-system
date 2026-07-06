@@ -49,7 +49,8 @@ only the power stage (below) differs.
 | Small 5V submersible pump | The common "3–6V mini submersible pump" hobby part, run at 5V. Low flow, which is actually right for drip-watering a single plant. |
 | Logic-level N-channel MOSFET (e.g. AO3400 or IRLZ44N) | Low-side switch between pump's negative terminal and ground. Gate driven from a GPIO through a ~100Ω series resistor; add a 10kΩ pull-down gate-to-ground so the pump can't twitch on during MCU boot/reset. |
 | Flyback diode (1N5819 Schottky or 1N4148) | Across the pump terminals, to absorb the inductive kick when the MOSFET switches off. Motors are inductive loads — skip this and you'll eventually kill a MOSFET. |
-| INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead/reservoir dry if using a pump that stalls dry) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. |
+| INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead/reservoir dry if using a pump that stalls dry) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. Doubles as a secondary dry-run diagnostic alongside the float switch below. |
+| Mini float switch (vertical or horizontal, normally-open) | Mounted at the "near-empty" level inside the reservoir, wired to a GPIO (with pull-up/pull-down as appropriate for the switch type). This is the primary, hardware-only dry-run safety cutoff — checked every wake cycle before the pump is ever commanded on, independent of the hub, network, or the volume-tracking estimate. |
 | Reserved I2C header pads | Not populated yet — for the Phase 2 humidity/temperature sensor (e.g. SHT31). Leaving the header now avoids a board respin later. |
 
 ## Satellite — outlet-powered variant
@@ -87,3 +88,7 @@ For satellites out of outlet reach.
       level of pump-fault detection is wanted for v1, vs. deferring to a
       simpler heartbeat-only "detected" status first and adding current
       sensing later.
+- [ ] Float switch mounting depends on container shape/size (e.g. an 8L
+      jerrycan vs. a wide bucket need different switch geometry/orientation)
+      — pick per-container once actual containers are chosen, not a single
+      universal part.
