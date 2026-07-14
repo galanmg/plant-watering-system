@@ -1,9 +1,10 @@
 # Architecture
 
-Status: design phase, hardware being ordered. This doc is updated as decisions
-get made — treat "Open questions" as the running to-do list. See
+Status: design phase, hardware ordered/ordering. This doc is updated as
+decisions get made — treat "Open questions" as the running to-do list. See
 [project-overview.md](project-overview.md) for the decision log and step
-checklist, and [hardware.md](hardware.md) for the shopping list.
+checklist, and [hardware.md](hardware.md) for the shopping list and purchase
+status.
 
 Last updated: 2026-07-14
 
@@ -53,23 +54,29 @@ module and registering it on the hub.
 
 **Everything runs at ~5V from standard USB chargers.** No solar/LiPo
 variants in v1 — every node (hub and satellites) sits near a socket with a
-5V ≥2A USB charger. Consequences:
+5V USB charger. This constraint also drove the pump choice (see Pump
+satellite): 5V submersibles keep the whole system on one charger type,
+where peristaltics would have forced 12V adapters + buck converters.
+Consequences:
 
 - Satellites don't need deep-sleep battery discipline. They can stay awake
   and check in on a simple timer, which removes a whole class of
   wake/sleep/RTC complexity from v1 firmware. Deep sleep remains a future
   optimization if a battery/solar satellite variant ever happens.
 - The pump is fed **from the charger's 5V rail through the MOSFET module,
-  never from the ESP32's 5V pin** (pin limit ~500 mA; the pump can exceed
-  it). Common ground between ESP32, MOSFET module and pump supply.
+  never from the ESP32's 5V pin** (pin limit ~500 mA) — and switching the
+  motor on its own rail keeps electrical noise away from the board.
+- Common ground between ESP32, MOSFET module and pump supply.
 
 ## Hub
 
 - Hardware: **ESP32-WROOM-32U DevKit + external 2.4 GHz U.FL antenna**.
   The hub is the shared node of every wireless link, so it gets the
   antenna upgrade; satellites keep their PCB antennas (see Range).
-  ⚠️ Never power a 32U board without the antenna attached. Always powered
-  (USB charger).
+  ⚠️ Attach the antenna once, before first power-up, then leave it
+  connected: an open RF connector reflects transmit power back into the
+  amplifier, the U.FL connector tolerates only a few mating cycles, and
+  the 32U has no PCB-antenna fallback. Always powered (USB charger).
 - **Joins home WiFi as a station**, reachable at a normal LAN address (mDNS
   hostname, e.g. `plant-hub.local`) so it can just be bookmarked in a
   browser. Being WiFi-reliant for the *UI* is fine: the hub's actual
@@ -103,30 +110,35 @@ command back, act on it. Neither role stores any decision logic locally
 beyond "do what the hub just told me."
 
 Board choice (decided): **ESP32 WROOM-32 DevKit** — same full-size board
-as the hub (PCB-antenna variant). Not the ESP32-C3 "SuperMini" boards:
-their onboard antenna is notoriously weak through walls, and using one
-board family everywhere keeps firmware and spares interchangeable.
+family as the hub (PCB-antenna variant; v1 boards are 30-pin ELEGOO
+ESP-32S, see [hardware.md](hardware.md)). Not the ESP32-C3 "SuperMini"
+boards: their onboard antenna is notoriously weak through walls, and using
+one board family everywhere keeps firmware and spares interchangeable.
 
 **Pump satellite**
 
-- Hardware: ESP32 WROOM-32 DevKit + **logic-level MOSFET driver module**
-  (must switch fully on with a 3.3V gate — verify per part, plain IRF520
-  modules often need 5V) + **5V peristaltic pump** + USB charger power.
-  MOSFET over relay: cheaper, silent, no wearing contacts, and supports
-  PWM flow control later.
-- Pump type (decided): **peristaltic**, not submersible. Why:
-  - **Precise dosing.** Flow rate is stable and calibratable (mL per
-    second of runtime), so the hub can command real volumes, which is what
-    the reservoir volume tracking below is built on.
-  - **Self-priming and dry-safe.** The motor never touches the water and
-    doesn't rely on it for cooling — running dry doesn't damage it. This
-    reshapes dry-run protection entirely (see that section).
-  - **Mounts dry.** The pump sits outside the reservoir; only a silicone
-    tube dips in. Cleaner enclosures, no waterproofing of wires.
-  - Trade-offs accepted: lower flow rate (fine for pots), the silicone
-    tube is a consumable (fine for short daily bursts — spare tubing is on
-    the shopping list), and current draw can reach ~500 mA+ (hence the
-    charger-rail-through-MOSFET rule above).
+- Hardware: ESP32 DevKit + **logic-level MOSFET driver module** (must
+  switch fully on with a 3.3V gate — verify per part, plain IRF520
+  modules often need 5V) + **5V mini submersible pump** + USB charger
+  power. MOSFET over relay: cheaper, silent, no wearing contacts, and
+  supports PWM later.
+- Pump type (decided for v1): **5V mini submersible** — cheap (~€4),
+  100–200 mA (comfortably USB-powered), high flow (~100 L/h). Chosen over
+  peristaltic on cost and 5V availability; trade-offs accepted:
+  - **Cannot run dry** — the motor needs water for cooling. This is the
+    load-bearing constraint behind Dry-run protection below.
+  - **Time-based dosing, not volumetric** — flow varies with water level
+    (drops as the reservoir empties), so "run N seconds" delivers a
+    shrinking amount over time. Fine for pot plants (±30% tolerance);
+    handled with a generous margin in volume tracking.
+  - Pump lives inside the reservoir (waterproofed wires), limited head
+    height (~0.4–1 m) — reservoir at roughly pot level, and the pump body
+    must stay submerged, so the bottom few cm are dead volume.
+  - **Upgrade path kept:** peristaltic pumps (precise dosing, dry-safe,
+    mounts outside the water) remain the targeted per-module upgrade if
+    the project proves itself — pump type is invisible to the
+    architecture; upgrading = swap pump + recalibrate that satellite's
+    mL/s figure, nothing else changes.
 - No float switch on board — reservoir level is the monitor satellite's
   job (deferred), since a reservoir can be shared by several pumps.
 - Identified by MAC, assigned to a reservoir and given a friendly name in
@@ -134,21 +146,21 @@ board family everywhere keeps firmware and spares interchangeable.
 - Behavior: check in with the hub on a timer; hub replies with either
   "don't run" or "run for N seconds"; satellite acts on that instruction,
   reports the outcome, waits for the next cycle.
-- Each pump gets a one-time **calibration** at bring-up: run for a fixed
-  time into a measuring cup, record mL/s in the hub registry. All dosing
-  math uses that per-pump figure.
+- Each pump gets a **calibration** at bring-up: run for a fixed time into a
+  measuring cup at the reservoir's typical fill level, record mL/s in the
+  hub registry; re-check near "low" level to size the dosing margin.
 
 **Monitor satellite (deferred past v1)**
 
-- Design kept for later: ESP32 WROOM-32 + a float switch at the
+- Design kept for later: ESP32 DevKit + a float switch at the
   "near-empty" level — no pump/MOSFET, it drives nothing. Deliberately
   minimal and DIY/3D-print friendly for the mechanical mounting.
 - One monitor per reservoir; a reservoir can feed multiple pump satellites.
 - Behavior when built: report `reservoir_id` + empty/not-empty on a timer
   (e.g. every 30–60 min — level changes slowly).
-- **Why it can wait:** with peristaltic pumps, an empty reservoir no longer
-  threatens the pump hardware (see Dry-run protection). v1 covers the
-  "know when it's empty" need with volume tracking + a safety margin.
+- **Why it can wait for v1:** oversized reservoirs + conservative volume
+  tracking cover the vacation scenario; the monitor is the reliability
+  upgrade that removes guesswork when it lands.
 
 ## Status LEDs (post-v1 nice-to-have)
 
@@ -174,55 +186,53 @@ page covers it. Design kept:
   one GPIO data line rather than 10 discrete LEDs on 10 GPIOs — color and
   blink become software-defined per LED.
 
-## Dry-run protection (reframed for peristaltic pumps)
+## Dry-run protection
 
-The original design assumed cheap submersible pumps, which burn out if run
-dry. **Peristaltic pumps (decided, see Satellites) can run dry without
-damage** — the motor never touches the water. So the risk model changes:
+Cheap submersible pumps aren't rated to run dry — the motor relies on the
+water for cooling, so an empty reservoir can burn one out. The hub is the
+sole decision-maker (see Satellites), so this logic lives on the hub. Two
+things soften the problem in v1 compared to the original worst case:
+pumps cost ~€4 (sacrificial, spare on hand), and the primary mitigation is
+physical, not clever — **oversize the reservoirs** so they mathematically
+can't empty during a trip.
 
-- **Old risk:** empty reservoir destroys pump hardware → needed real-time
-  abort (INA219 current signature within 1–2 s).
-- **New risk:** empty reservoir means the pump runs, doses nothing, and the
-  hub's log says "watered" while the plant silently gets nothing for the
-  rest of the trip.
+The design goal, kept from the original: a failing information source
+should degrade gracefully, not take plants down with it. v1 layers:
 
-Protection in v1 is therefore about **truthful accounting, not hardware
-survival**, and lives entirely on the hub:
-
-1. **Volume tracking with a safety margin.** The hub tracks cumulative
-   dispensed volume per reservoir (below). When the margin-adjusted
-   remaining volume hits zero, the hub marks the reservoir empty and stops
-   scheduling every pump attached to it — and flags it prominently in the
-   UI. The margin absorbs drift in the estimate (dosing is calibrated but
-   still an estimate).
-2. **"Refill" in the UI** resets the counter and clears the empty flag
+1. **Oversized reservoirs** — sized so a full vacation's schedule uses well
+   under capacity. First and best line of defense; costs nothing.
+2. **Volume tracking with a conservative margin.** The hub tracks
+   cumulative dispensed volume per reservoir (below). When the
+   margin-adjusted remaining volume hits zero, the hub marks the reservoir
+   empty, stops scheduling every pump attached to it, and flags it in the
+   UI. The margin is generous because time-based dosing with submersibles
+   drifts as the level drops.
+3. **"Refill" in the UI** resets the counter and clears the empty flag
    after a physical top-up.
-3. **Design principle kept from the original:** a failing information
-   source should degrade gracefully, not take plants down with it. In v1
-   the only source is the estimate itself, so the margin leans
-   conservative-but-not-paranoid: stop a bit early, don't stop constantly.
 
 Deferred layers (kept for later, slot into the same hub logic unchanged):
 
-- **Monitor satellite** (float switch): when built, a fresh reading takes
-  priority over the estimate; a fresh "not-empty" clears the empty flag;
-  a stale monitor falls back to the margin-adjusted estimate — exactly the
-  old design, minus the panic.
-- **INA219 current sensing** per pump satellite: diagnostic "pump
-  detected" — catches faults the float switch never could (clogged tubing,
-  dead motor: "commanded on, drew ~0 mA"). Valuable, but no longer
-  time-critical since nothing breaks in 1–2 s; can be added as a plain
-  reported metric whenever.
+- **Monitor satellite** (float switch): a fresh reading takes priority
+  over the estimate; a fresh "not-empty" clears the empty flag; a stale
+  monitor falls back to the margin-adjusted estimate.
+- **INA219 current sensing** per pump satellite: real-time dry detection
+  (an unprimed/dry pump has a different current signature) plus diagnostic
+  "pump detected" — catches faults nothing else can see, like clogged
+  intake or a dead motor ("commanded on, drew ~0 mA"). With submersibles
+  this guards actual hardware, so it's the first deferred item worth
+  revisiting if a pump ever burns out in practice.
 
 ## Reservoir tracking & logging
 
 - Each reservoir (not each satellite — reservoirs can be shared) has a
   configured **capacity** (e.g. 8000 mL) and name, editable in the hub UI.
+  Configure *usable* capacity: submersible pumps must stay covered, so the
+  bottom few cm don't count.
 - The hub keeps a running **cumulative volume dispensed since last refill**
   per reservoir: every watering event from *any* satellite drawing on that
   reservoir adds `duration_run × that pump's calibrated flow rate (mL/s)`
-  to the reservoir's total. With calibrated peristaltic pumps this estimate
-  is decent, but it's still an estimate (no flow sensor).
+  to the reservoir's total. An estimate (no flow sensor), and a drifting
+  one with submersibles — hence the generous margin in Dry-run protection.
 - A **"refill" action** in the hub UI resets a reservoir's cumulative
   dispensed total to zero.
 - **Days-until-empty** per reservoir is computed by projecting the
@@ -297,11 +307,11 @@ not the channel — but it's a real implementation detail to not gloss over.
 - **Satellites:** standard PCB antennas. ESP-NOW's tiny packets survive
   links that would choke a webpage; through 2–3 interior walls the PCB
   antenna is normally enough.
-- **Contingency:** one spare 32U + antenna in the parts order. First thing
-  after bring-up (before any enclosures): flash an ESP-NOW ping sketch and
-  walk each satellite to its real spot (balcony, indoor location). If a
-  location is flaky, swap that one satellite to the spare 32U — no
-  over-buying up front.
+- **Contingency:** one spare 32U + antenna as an optional add-on to the
+  parts order. First thing after bring-up (before any enclosures): flash an
+  ESP-NOW ping sketch and walk each satellite to its real spot (balcony,
+  indoor location). If a location is flaky, swap that one satellite to the
+  spare 32U — no over-buying up front.
 
 ## Open questions
 
@@ -311,18 +321,20 @@ not the channel — but it's a real implementation detail to not gloss over.
 - [x] Module power source: **resolved as USB chargers everywhere** for v1 —
       see Power. Solar+LiPo variant shelved with deep-sleep firmware as a
       possible future satellite type.
-- [x] Pump type: **resolved as 5V peristaltic** — see Pump satellite. This
-      also reframed dry-run protection from hardware-survival to truthful
-      accounting.
+- [x] Pump type: **resolved as 5V mini submersible for v1** (cost +
+      5V-availability; peristaltic kept as the per-module upgrade path) —
+      see Pump satellite. Dry-run protection is therefore
+      hardware-survival: oversized reservoirs + conservative volume margin.
 - [x] What does "pump detected" mean exactly — INA219 current sensing,
-      **deferred past v1** (no longer time-critical with dry-safe pumps);
-      see Dry-run protection.
+      **deferred past v1**; first deferred item to revisit if a pump ever
+      burns out. See Dry-run protection.
 - [x] Water source per module: **resolved as shared reservoirs**; monitor
-      satellites deferred, v1 covers it with volume tracking + margin.
+      satellites deferred, v1 covers it with oversized reservoirs + volume
+      tracking + margin.
 - [x] Communication: **resolved as ESP-NOW**, hub-mediated only — see
       Communication section.
 - [x] Range strategy: **resolved** — 32U hub + PCB-antenna satellites +
-      one contingency 32U + range test before enclosures. See Range.
+      optional contingency 32U + range test before enclosures. See Range.
 - [ ] ESP-NOW + WiFi-STA channel coupling on the hub (see Communication
       section) — decide how satellites detect/follow a router channel
       change. Candidate: satellites scan for the hub if N check-ins fail.
@@ -330,6 +342,8 @@ not the channel — but it's a real implementation detail to not gloss over.
       contingency 32U gets used.
 - [ ] Log sizing on real flash once event volume is known (45-day retention
       assumption).
+- [ ] MOSFET module selection — must be 3.3V-gate logic-level; still to
+      find and validate (see [hardware.md](hardware.md)).
 
 ## Phase 2 (winter): sensing
 
@@ -341,3 +355,5 @@ not the channel — but it's a real implementation detail to not gloss over.
   satellite's check-in cycle and reporting the values — the wireless link
   and hub schedule model already support it, since the hub already makes
   every watering decision.
+- Same window: optional peristaltic pump upgrades and INA219 current
+  sensing (see Pump satellite / Dry-run protection).
