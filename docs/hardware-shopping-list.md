@@ -1,79 +1,58 @@
-# Hardware shopping list request
+# Hardware — Shopping List & Part Requirements
 
-I'm building a DIY automated plant-watering system (ESP32-based). The
-design is settled — what I need now is help turning each part *class*
-below into an actual, currently-purchasable product (model/part number,
-approximate price, a reasonable vendor like Amazon/AliExpress/DigiKey/
-Mouser), while keeping everything consistent with the constraints noted.
+> Companion to [project-overview.md](project-overview.md).
+> Scope: **1 hub + 2 pump modules**, scalable later by buying more module kits.
+> Before ordering anything: paste the listing/datasheet into a chat to proof-check.
 
-Please recommend specific products for each line item, grouped the same
-way as below, and flag anything where a cheaper/better alternative exists
-that still meets the constraint.
+- **Author:** Andrés Moreno (galanmg)
+- **Last updated:** 2026-07-14
 
-## System constraints (apply to everything)
+---
 
-- **Single 5V rail throughout** — hub, satellites, and pumps all run on
-  5V. Prefer parts that are natively 5V or regulate cleanly to 5V; avoid
-  anything that forces a second voltage domain (e.g. skip 12V pumps).
-- Two MCU families used across the system: a full **ESP32 (WROOM-32)** for
-  the hub, and **ESP32-C3** mini boards for satellites (cheaper/smaller,
-  still supports WiFi/ESP-NOW + deep sleep).
-- This is a hobby/DIY build — favor cheap, commonly-stocked hobbyist parts
-  over industrial/precision equivalents, unless a constraint below rules
-  a cheap option out.
+## 1. Order NOW (long lead time, e.g. AliExpress)
 
-## Quantities
+| Item | Qty | What to search for | Reference / spec to match |
+|------|-----|--------------------|---------------------------|
+| ESP32 board, **external antenna** (hub) | 1 | "ESP32 WROOM-32U external antenna" / "ESP32 DevKit U.FL" | WROOM-**32U** variant, U.FL/IPEX connector |
+| 2.4 GHz antenna for the hub | 1 (2 if not bundled with board) | "2.4GHz WiFi antenna U.FL IPEX 3dBi" | 2.4 GHz, U.FL/IPEX connector, ~3 dBi |
+| ESP32 board, PCB antenna (modules + spares) | 4 | "ESP32 DevKit V1 30 pin" / "ESP32 WROOM-32 development board" | Standard WROOM-32 DevKit. Avoid ESP32-C3 "SuperMini" (weak antenna through walls) |
+| Contingency: 1 extra 32U + antenna | 1 + 1 | (same as hub) | Swap into any module location that fails the range test |
+| 5V peristaltic pump | 3 (2 + 1 spare) | "peristaltic pump 5V dosing" | Match specs of Adafruit #3910 (5–6V, self-priming): https://www.adafruit.com/product/3910 |
+| Logic-level MOSFET driver module | 3 (2 + 1 spare) | "MOSFET trigger switch driver module" | ⚠️ MUST switch with a **3.3V** gate signal (logic-level). Verify before buying |
+| Silicone tubing (spare, consumable) | 1 roll | "silicone tubing 3mm ID" | Match inner diameter to the pump's barbs (usually ~3 mm ID) |
 
-Ordering for an initial test build first:
+**Total boards: 6** (1 hub-32U + 4 standard + 1 contingency-32U). The 2 standard
+spares also serve the future car project.
 
-- **1× hub**
-- **1× reservoir + 1× monitor satellite**
-- **3× pump satellites**, all drawing from that one reservoir
+## 2. Buy LATER, locally / Amazon (fast shipping)
 
-Planned eventual scale (not ordering yet, but worth knowing when picking
-vendors/pack sizes): **3–4 reservoirs total, at least 3 pump satellites
-each** — so roughly 9–12+ pump satellites and 3–4 monitor satellites down
-the line. Prefer parts sold in multi-packs or with good per-unit pricing
-at that kind of quantity where it doesn't compromise quality.
+| Item | Qty (approx) | Notes |
+|------|--------------|-------|
+| USB chargers 5V ≥2A | 1 per device (3) | Must supply pump peak current with margin |
+| USB cables (data-capable for flashing) | 3+ | Some charge-only cables cannot flash boards |
+| Breadboards | 2 | Prototyping before soldering anything |
+| Jumper wires (M-M, M-F) | 1 kit | |
+| Barbed T/Y splitters | a few | For the multi-pot indoor module |
+| Water reservoirs | 2 | Any food container works to start |
+| Project enclosures | 3 | ⚠️ **PLASTIC**, never metal (blocks 2.4 GHz) |
 
-## Hub (qty: 1)
+## 3. Validation checklist per part (before paying)
 
-| Part | Requirement |
-|---|---|
-| MCU dev board | ESP32-WROOM-32 (regular, not -C3) — needs headroom to run a web server + WiFi station + ESP-NOW bridging simultaneously. Common "ESP32 DevKitC"-style board. |
-| Power supply | 5V/1A USB wall adapter + cable, always plugged in. |
-| Status LED strip | **10-LED WS2812B (NeoPixel) addressable strip or bar**, individually addressable (need per-LED color: green/blue, and per-LED blink control via firmware). |
-| Status button | Momentary push button (normally-open), panel/PCB-mount style. |
-| Enclosure | Small vented plastic project box, big enough to mount the board, LED strip, and button on/through the front face; keep the WiFi antenna area clear of metal. |
+Paste the listing into a chat and confirm:
 
-## Pump satellite (qty: 3 for now, plan for growth)
+- **ESP32 boards:** WROOM-32 (or 32U for hub), USB port for flashing,
+  breadboard-friendly pin spacing.
+- **Pump:** runs at 5V; note stall/max current (must be < charger capacity with
+  margin); barb diameter noted (to buy matching tubing).
+- **MOSFET module:** triggers fully ON with 3.3V gate signal (logic-level part,
+  e.g. IRLZ44N-class). Plain IRF520 modules often need 5V gate — check carefully.
+- **Antenna:** 2.4 GHz (NOT 868 MHz / LoRa / Sigfox), U.FL/IPEX connector.
 
-| Part | Requirement |
-|---|---|
-| MCU dev board | ESP32-C3 mini dev board, deep-sleep capable. |
-| Pump | Small 5V-rated mini submersible pump (common "3–6V mini submersible pump" hobby part, run at 5V). Low flow is fine/preferred — this is drip-watering a single houseplant, not irrigation. |
-| MOSFET | Logic-level N-channel MOSFET for a low-side switch (e.g. AO3400 or IRLZ44N class) — must be gate-driven directly from a 3.3V GPIO. |
-| Flyback diode | Small Schottky or general-purpose diode (e.g. 1N5819 or 1N4148) to go across the pump terminals. |
-| Current/voltage sensor | INA219 I2C current/voltage sensor breakout, inline with the pump's power feed. |
-| Resistors | ~100Ω gate series resistor + ~10kΩ gate pull-down per unit (can just be a resistor assortment kit, not a dedicated purchase). |
-| Power stage — outlet variant | 5V/1A USB wall adapter (if this satellite will sit near an outlet). |
-| Power stage — solar/battery variant | 3.7V LiPo battery (2000–3000mAh) + small 6V 1–2W solar panel + a **solar-capable** LiPo charge controller (built around a chip like MCP73871 or BQ24074 — explicitly *not* a plain TP4056, which expects a regulated 5V USB input, not raw solar) + a small boost converter module (LiPo → clean 5V). |
+## 4. Wiring rules (safety notes to remember)
 
-For the test build, assume **outlet-powered** for all 3 pump satellites
-unless you know of a solar/battery kit cheap enough to be worth building
-both variants from the start — otherwise just quote the outlet variant for
-now and the solar/battery parts separately as a "for later" list.
-
-## Reservoir monitor satellite (qty: 1 for now, plan for growth)
-
-| Part | Requirement |
-|---|---|
-| MCU dev board | ESP32-C3 mini dev board, same as pump satellites (shared firmware/tooling). |
-| Float switch | Mini float switch (vertical or horizontal, normally-open), sized/oriented for mounting at the "near-empty" level inside the reservoir. Mechanical mounting/bracket is DIY/3D-printed on my end — just need the electrical switch component recommended here. |
-| Power stage | Same outlet or solar/battery options as the pump satellite above — recommend the outlet variant for the test build. |
-
-## What I don't need recommendations on
-
-- The 3D-printed/DIY mechanical mounting for the float switch (per-container,
-  handled separately).
-- Software/firmware — this list is purely for physical parts to buy.
+- Pump power comes **from the charger's 5V rail, through the MOSFET module** —
+  never from the ESP32's 5V pin (limit ~500 mA, pumps can exceed it).
+- Common ground between ESP32, MOSFET module and pump supply.
+- On the 32U hub: **connect the antenna before powering** the board.
+- Keep water, tubing and reservoirs physically below/away from the electronics
+  (drips fall down).
