@@ -63,10 +63,12 @@ Consequences:
   and check in on a simple timer, which removes a whole class of
   wake/sleep/RTC complexity from v1 firmware. Deep sleep remains a future
   optimization if a battery/solar satellite variant ever happens.
-- The pump is fed **from the charger's 5V rail through the MOSFET module,
-  never from the ESP32's 5V pin** (pin limit ~500 mA) — and switching the
-  motor on its own rail keeps electrical noise away from the board.
-- Common ground between ESP32, MOSFET module and pump supply.
+- The pump is fed **from the charger's 5V rail through the relay contacts
+  (COM/NO), never from the ESP32's 5V pin** (pin limit ~500 mA) — and
+  switching the motor on its own rail keeps electrical noise away from the
+  board. Wiring through NO (normally open) is fail-safe: relay off or
+  unpowered = pump disconnected.
+- Common ground between ESP32, relay module and pump supply.
 
 ## Hub
 
@@ -117,11 +119,15 @@ one board family everywhere keeps firmware and spares interchangeable.
 
 **Pump satellite**
 
-- Hardware: ESP32 DevKit + **logic-level MOSFET driver module** (must
-  switch fully on with a 3.3V gate — verify per part, plain IRF520
-  modules often need 5V) + **5V mini submersible pump** + USB charger
-  power. MOSFET over relay: cheaper, silent, no wearing contacts, and
-  supports PWM later.
+- Hardware: ESP32 DevKit + **5V relay module with optocoupler**
+  (confirmed to trigger from a 3.3V ESP32 GPIO; opto-isolation shields
+  the GPIO from coil noise) + **5V mini submersible pump** + USB charger
+  power. Relay over MOSFET (decision reversed): proven 3.3V-gate MOSFET
+  boards were hard to source, v1 doses by time so PWM isn't needed, and
+  contact wear is irrelevant at a few switchings per day. ⚠️ Trigger
+  jumper set to HIGH-level and signal on a boot-quiet GPIO (25/26/27,
+  never strapping pins 0/2/12/15) so the pump can't blip while the ESP32
+  boots.
 - Pump type (decided for v1): **5V mini submersible** — cheap (~€4),
   100–200 mA (comfortably USB-powered), high flow (~100 L/h). Chosen over
   peristaltic on cost and 5V availability; trade-offs accepted:
@@ -153,7 +159,7 @@ one board family everywhere keeps firmware and spares interchangeable.
 **Monitor satellite (deferred past v1)**
 
 - Design kept for later: ESP32 DevKit + a float switch at the
-  "near-empty" level — no pump/MOSFET, it drives nothing. Deliberately
+  "near-empty" level — no pump/relay, it drives nothing. Deliberately
   minimal and DIY/3D-print friendly for the mechanical mounting.
 - One monitor per reservoir; a reservoir can feed multiple pump satellites.
 - Behavior when built: report `reservoir_id` + empty/not-empty on a timer
@@ -342,8 +348,10 @@ not the channel — but it's a real implementation detail to not gloss over.
       contingency 32U gets used.
 - [ ] Log sizing on real flash once event volume is known (45-day retention
       assumption).
-- [ ] MOSFET module selection — must be 3.3V-gate logic-level; still to
-      find and validate (see [hardware.md](hardware.md)).
+- [x] Pump driver: **resolved as 5V opto-isolated relay module** (MOSFET
+      plan dropped — sourcing a proven 3.3V-gate one was the last blocker
+      and v1 needs no PWM). See Pump satellite and
+      [hardware.md](hardware.md).
 
 ## Phase 2 (winter): sensing
 
