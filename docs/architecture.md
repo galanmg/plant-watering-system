@@ -1,7 +1,36 @@
 # Architecture
 
-Status: draft, nothing built yet. This doc is meant to be updated as decisions
-get made — treat "Open questions" as the running to-do list.
+Status (2026-08-04): first hub + first pump satellite built and proven
+end-to-end. This doc still describes the **target design** — see below for
+exactly what's real in the firmware today vs. still a placeholder.
+
+## Current implementation status
+
+What's actually running, as of the first satellite build:
+
+- **Hub** (`firmware/hub/`) — joins home WiFi, syncs time via NTP (Madrid
+  TZ), serves a status web page (`plant-hub.local`) showing synced time and
+  last satellite check-in, receives ESP-NOW messages from satellites.
+  Nightly 23:00 trigger exists but only logs to serial — **not yet wired to
+  actually command any satellite.** No web-based configuration (schedule
+  editing, satellite registry, LEDs) yet — all deferred, see hardware.md's
+  hub section for the LED panel that hasn't been wired in.
+- **Pump satellite** (`firmware/pump-satellite/`) — one board built and
+  proven: joins the ESP-NOW link on a hardcoded channel/hub MAC, sends a
+  periodic "hello" the hub displays, and drives a relay-switched pump
+  (confirmed moving water). **Current firmware is a one-shot test**
+  (runs the pump once, 5s after boot, for 3s) — not yet the real
+  check-in → hub-decides → run-or-not → report-outcome protocol described
+  below. No deep sleep yet (satellite runs full-power continuously). No
+  INA219 current sensing / dry-run abort yet. Only 1 of the planned 3 pump
+  satellites is built; the plan is to nail this one satellite's real
+  protocol first, then clone the wiring+firmware onto the other two.
+- **Monitor satellite** — not started.
+- **Channel-pinning caveat is live, not just theoretical**: the satellite's
+  WiFi channel is hardcoded in `firmware/pump-satellite/include/config.h`
+  to match whatever channel the home router currently puts the hub on
+  (verified via `nmcli`/`iw`, not read automatically) — see the open
+  question below, still unsolved.
 
 ## Overview
 

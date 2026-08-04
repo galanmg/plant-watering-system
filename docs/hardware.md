@@ -1,8 +1,13 @@
 # Hardware draft
 
-Status: draft, nothing ordered yet. Part numbers below are starting points
-for sourcing, not a locked BOM — treat as "this class of part," swap for
-whatever's actually in stock when we order.
+Status (2026-08-04): hub built and running (ESP32-WROOM-32U). First pump
+satellite built and proven end-to-end — relay-driven pump control confirmed
+moving water, ESP-NOW check-in to the hub confirmed working. See
+`firmware/` for what's actually flashed, and `docs/architecture.md`'s
+Status section for what's still a placeholder vs. real. Part numbers below
+are largely confirmed-in-use now rather than starting points, but treat
+anything not marked "in use" as still a draft — swap for whatever's
+actually in stock.
 
 ## Voltage strategy: standardize on 5V
 
@@ -47,11 +52,11 @@ only the power stage (below) differs.
 
 | Part | Notes |
 |---|---|
-| ESP32-C3 mini dev board | Cheaper and smaller than full ESP32, still supports WiFi/ESP-NOW and deep sleep. Good fit since satellites just wake, report, maybe pump, sleep. |
-| Small 5V submersible pump | The common "3–6V mini submersible pump" hobby part, run at 5V. Low flow, which is actually right for drip-watering a single plant. |
-| Logic-level N-channel MOSFET (e.g. AO3400 or IRLZ44N) | Low-side switch between pump's negative terminal and ground. Gate driven from a GPIO through a ~100Ω series resistor; add a 10kΩ pull-down gate-to-ground so the pump can't twitch on during MCU boot/reset. |
-| Flyback diode (1N5819 Schottky or 1N4148) | Across the pump terminals, to absorb the inductive kick when the MOSFET switches off. Motors are inductive loads — skip this and you'll eventually kill a MOSFET. |
-| INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. Also a secondary diagnostic for faults the reservoir monitor's float switch can't catch (e.g. clogged tubing). |
+| ESP32 dev board | **In use for the test build: ESP32-WROOM-32 (ELEGOO 3-pack, already purchased)** — fully capable (WiFi/ESP-NOW, deep sleep, GPIO/I2C), just bigger/pricier/thirstier in deep sleep than the ESP32-C3 mini originally planned here. Fine for outlet-powered satellites, which is the whole test build. Revisit C3 specifically if/when a solar/battery satellite gets built, where deep-sleep current actually matters. |
+| Small 5V submersible pump | The common "3–6V mini submersible pump" hobby part, run at 5V. Low flow, which is actually right for drip-watering a single plant. **In use: RUNCCI-YUN mini submersible, DC 3–5V, 0.18A draw, brushless** (already purchased, 3-pack) — confirmed working in the first satellite build. |
+| Switch: relay module (in use) or MOSFET (originally planned) | **Test build uses a GTIWUNG 5V 1-channel relay module** (opto-isolated, screw terminals COM/NO/NC, `DC+`/`DC-`/`IN` on the logic side) instead of a bare MOSFET — already on hand, and confirmed working end-to-end (relay clicks, pump moves water) as of the first satellite build. Trigger is **active-HIGH** on this specific module (GPIO HIGH energizes the relay) — note this is empirically confirmed per-module, not guaranteed for a different relay board; re-check if swapping module brands. Wiring: pump `+` through `NO`, relay `COM` to the 5V supply, pump `−` and relay `DC-` share ground with the ESP32. A bare logic-level MOSFET (AO3400/IRLZ44N class) remains a valid lower-cost/smaller alternative for later satellites if desired — not required, the relay works fine at this scale. |
+| Flyback diode (1N5819 Schottky or 1N4148) | Across the pump terminals, to absorb the inductive kick when the switch turns off. **Not installed in the first satellite build** — relay contacts tolerate this small pump's inductive kick (180mA) better than a bare MOSFET would, so it wasn't a blocker to get the first working build done, but it's still good practice and cheap to retrofit if one turns up. |
+| INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. Also a secondary diagnostic for faults the reservoir monitor's float switch can't catch (e.g. clogged tubing). **Not yet installed** — the first satellite build proved relay+pump control only; dry-run current sensing is still open, see firmware TODOs. |
 | Reserved I2C header pads | Not populated yet — for the Phase 2 humidity/temperature sensor (e.g. SHT31). Leaving the header now avoids a board respin later. |
 
 Note: no float switch on the pump satellite itself — reservoirs are shared
@@ -86,7 +91,7 @@ satellite (above), whichever fits where the container lives.
 
 | Part | Notes |
 |---|---|
-| ESP32-C3 mini dev board | Same board family as the pump satellite, for one firmware/tooling setup across both node types. |
+| ESP32 dev board | Same board family as the pump satellite (see note there) — ESP32-WROOM-32 for the test build, for one firmware/tooling setup across both node types. |
 | Mini float switch (vertical or horizontal, normally-open) | Mounted at the "near-empty" level inside the reservoir, wired to a GPIO (with pull-up/pull-down as appropriate for the switch type). This is the primary, hardware-only dry-run safety cutoff. Mechanical mounting (bracket, enclosure) is a DIY/3D-print detail per container shape — not a fixed part spec. |
 
 ## Open items to settle before ordering
