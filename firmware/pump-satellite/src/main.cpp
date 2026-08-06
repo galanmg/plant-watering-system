@@ -10,6 +10,7 @@ enum : uint8_t {
   MSG_CHECK_IN = 1,
   MSG_COMMAND = 2,
   MSG_REPORT = 3,
+  MSG_ACK = 4,
 };
 struct CheckInMsg {
   uint8_t type;
@@ -17,11 +18,17 @@ struct CheckInMsg {
 };
 struct CommandMsg {
   uint8_t type;
-  uint16_t runMs;
+  uint32_t commandId;
+  uint32_t runMs;
 };
 struct ReportMsg {
   uint8_t type;
-  uint16_t ranMs;
+  uint32_t commandId;
+  uint32_t ranMs;
+};
+struct AckMsg {
+  uint8_t type;
+  uint32_t commandId;
 };
 
 const int RELAY_PIN = 26;
@@ -35,7 +42,24 @@ const unsigned long CHECK_IN_INTERVAL_MS = 5000;
 // own context, and blocking or sending from inside it can wedge the
 // ESP-NOW/WiFi stack. Actually running the pump is deferred to loop().
 volatile bool pendingRun = false;
-volatile uint16_t pendingRunMs = 0;
+volatile uint32_t pendingCommandId = 0;
+volatile uint32_t pendingRunMs = 0;
+
+// Dedupes the hub's 2x-redundant command sends — see onEspNowRecv().
+volatile bool hasSeenCommand = false;
+volatile uint32_t lastSeenCommandId = 0;
+
+// After a run, keep resending the report until the hub acks it (or we
+// give up). Spaced out rather than a tight burst, and non-blocking — this
+// can take minutes without holding up check-ins, which is fine since
+// watering happens at most 3x/day and there are hours until the next one.
+volatile bool awaitingAck = false;
+volatile uint32_t awaitingCommandId = 0;
+uint32_t awaitingRanMs = 0;
+unsigned long lastReportSendMs = 0;
+unsigned long reportRetryStartMs = 0;
+const unsigned long REPORT_RETRY_INTERVAL_MS = 2000;
+const unsigned long REPORT_RETRY_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
 void sendCheckIn() {
   checkInCounter++;
@@ -49,31 +73,25 @@ void sendCheckIn() {
 // sleep, see architecture.md's Power section), and there's nothing else
 // this board needs to do mid-run. Safe to block here — called from
 // loop(), not from the ESP-NOW callback.
-void runPump(uint16_t runMs) {
-  Serial.printf("Running pump for %ums\n", runMs);
+void runPump(uint32_t commandId, uint32_t runMs) {
+  Serial.printf("Running pump for %ums (command #%u)\n", runMs, commandId);
   digitalWrite(RELAY_PIN, HIGH);
   delay(runMs);
   digitalWrite(RELAY_PIN, LOW);
   // Let any relay-switching electrical transient settle before keying the
-  // radio — suspected cause of the report send silently not landing.
+  // radio.
   delay(200);
 
-  ReportMsg report{MSG_REPORT, runMs};
-  // Sent 3x with a short gap — ESP-NOW delivery isn't guaranteed, and this
-  // is cheap insurance against an occasional dropped packet.
-  for (int i = 0; i < 3; i++) {
-    esp_err_t result =
-        esp_now_send(HUB_MAC, (uint8_t *)&report, sizeof(report));
-    Serial.printf("Report send attempt %d (%s)\n", i,
-                  result == ESP_OK ? "queued" : "error");
-    delay(150);
-  }
+  awaitingCommandId = commandId;
+  awaitingRanMs = runMs;
+  lastReportSendMs = 0;  // forces an immediate send on the next loop()
+  reportRetryStartMs = millis();
+  awaitingAck = true;
 
-  // Runs >= the check-in interval would otherwise make loop() immediately
-  // fire a check-in right after these report sends — two back-to-back
-  // esp_now_send() calls in the same loop iteration, which this SDK seems
-  // to drop rather than queue. Reset the timer so the next check-in waits
-  // its normal full interval instead.
+  // A run >= the check-in interval would otherwise make loop() fire a
+  // check-in immediately after — two back-to-back esp_now_send() calls in
+  // the same iteration, which this SDK seems to drop rather than queue.
+  // Reset the timer so the next check-in waits its normal full interval.
   lastCheckInMs = millis();
 }
 
@@ -84,9 +102,25 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (type == MSG_COMMAND && len == sizeof(CommandMsg)) {
     CommandMsg cmd;
     memcpy(&cmd, data, sizeof(cmd));
-    if (cmd.runMs > 0) {
+    // The hub sends each command 2x for reliability (same reasoning as
+    // this satellite retrying its report) — without this dedupe, the
+    // second copy arriving mid-run (easily possible: they're only 150ms
+    // apart, runs are usually seconds long) would queue a second run
+    // right after the first finishes.
+    bool isDuplicate = hasSeenCommand && cmd.commandId == lastSeenCommandId;
+    if (cmd.runMs > 0 && !isDuplicate) {
+      hasSeenCommand = true;
+      lastSeenCommandId = cmd.commandId;
+      pendingCommandId = cmd.commandId;
       pendingRunMs = cmd.runMs;
       pendingRun = true;
+    }
+  } else if (type == MSG_ACK && len == sizeof(AckMsg)) {
+    AckMsg ack;
+    memcpy(&ack, data, sizeof(ack));
+    if (awaitingAck && ack.commandId == awaitingCommandId) {
+      awaitingAck = false;
+      Serial.printf("Hub acked command #%u\n", ack.commandId);
     }
   } else {
     Serial.printf("Ignored ESP-NOW message: type=%d len=%d\n", type, len);
@@ -125,10 +159,26 @@ void setup() {
 void loop() {
   if (pendingRun) {
     pendingRun = false;
-    runPump(pendingRunMs);
+    runPump(pendingCommandId, pendingRunMs);
   }
 
   unsigned long nowMs = millis();
+
+  if (awaitingAck) {
+    if (nowMs - reportRetryStartMs > REPORT_RETRY_TIMEOUT_MS) {
+      Serial.printf("Gave up waiting for ack on command #%u\n",
+                    awaitingCommandId);
+      awaitingAck = false;
+    } else if (nowMs - lastReportSendMs >= REPORT_RETRY_INTERVAL_MS) {
+      lastReportSendMs = nowMs;
+      ReportMsg report{MSG_REPORT, awaitingCommandId, awaitingRanMs};
+      esp_err_t result =
+          esp_now_send(HUB_MAC, (uint8_t *)&report, sizeof(report));
+      Serial.printf("Report send for command #%u (%s)\n", awaitingCommandId,
+                    result == ESP_OK ? "queued" : "error");
+    }
+  }
+
   if (nowMs - lastCheckInMs >= CHECK_IN_INTERVAL_MS) {
     lastCheckInMs = nowMs;
     sendCheckIn();

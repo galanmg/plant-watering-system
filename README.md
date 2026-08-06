@@ -24,13 +24,14 @@ the plants. They wither.
 
 v1 target: 1 hub + 2 pump satellites, working before early September 2026
 (see [docs/architecture.md](docs/architecture.md)'s Overview). As of
-2026-08-06: the hub is running (WiFi, NTP-synced clock with a fallback
-clock for outages, a status/control web page), and the first pump
-satellite runs the real check-in/command/report protocol end-to-end, with
-a measured flow rate (12.5mL/s) driving a working manual "water N mL"
-control. See docs/architecture.md's "Current implementation status" for
-exactly what's real vs. still a placeholder, and
-[docs/firmware.md](docs/firmware.md) for how to build/flash.
+2026-08-06: the hub runs a real live-updating web control panel — a
+persisted, multi-satellite registry, per-slot (up to 3x/day) independent
+scheduling with its own dose per slot, manual test/water controls, and a
+confirmed command/report/ack protocol with retries. The first pump
+satellite is fully working end to end, including a real dosing bug
+(16-bit duration overflow above ~819mL) found and fixed. See
+docs/architecture.md's "Current implementation status" for the full
+writeup, and [docs/firmware.md](docs/firmware.md) for how to build/flash.
 
 ## Roadmap
 
@@ -39,16 +40,17 @@ exactly what's real vs. still a placeholder, and
    Monitor satellites, INA219 current sensing, and the LED panel are
    designed but explicitly deferred past v1.
    - [x] Hub: WiFi + NTP (with power-outage-resilient fallback clock) +
-         status/control web page + ESP-NOW
-   - [x] First pump satellite: real check-in → command → run → report
-         protocol, relay-driven pump, proven moving water
+         live-updating status/control web page + ESP-NOW
+   - [x] First pump satellite: real check-in → command → run → report →
+         ack protocol (with retries + dedup), relay-driven pump, proven
+         moving water
    - [x] Flow-rate calibration (measured, hardcoded) + manual "water N mL"
          web control
-   - [ ] Nightly schedule dosing a real amount (currently a 50mL
-         placeholder) rather than a bench-test value
+   - [x] Satellite registry persisted to flash, survives reboots
+   - [x] Per-satellite, per-slot (up to 3x/day) schedule with independent
+         dose per slot — replaces the old single nightly placeholder dose
    - [ ] Clone the proven satellite build onto the second pump satellite
          board
-   - [ ] Web-based schedule/status UI, satellite registry
    - [ ] Volume tracking + oversized-reservoir dry-run safety net
 2. **Post-v1** — monitor satellite (float switch), INA219 dry-run current
    sensing, status LED panel, remote access (outbound relay).

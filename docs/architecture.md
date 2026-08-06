@@ -1,13 +1,13 @@
 # Architecture
 
-Status: hub + first pump satellite built and proven end-to-end, with the
-real hub↔satellite protocol (not just a one-shot test), a measured flow
-rate, and WiFi/power-outage resilience. First physical steps toward the v1
-scope below. This doc is updated as decisions get made — treat "Open
-questions" as the running to-do list. See
-[project-overview.md](project-overview.md) for the decision log and step
-checklist, and [hardware.md](hardware.md) for the shopping list and purchase
-status.
+Status: hub + first pump satellite built and proven end-to-end, with a
+real multi-satellite registry, per-slot scheduling, a confirmed
+command/report/ack protocol, a live-updating web UI, and WiFi/power-outage
+resilience. First physical steps toward the v1 scope below. This doc is
+updated as decisions get made — treat "Open questions" as the running
+to-do list. See [project-overview.md](project-overview.md) for the
+decision log and step checklist, and [hardware.md](hardware.md) for the
+shopping list and purchase status.
 
 Last updated: 2026-08-06
 
@@ -17,45 +17,79 @@ What's actually running, as of the first satellite build (v1 target is 2
 pump satellites — see Overview below; only 1 is built so far):
 
 - **Hub** (`firmware/hub/`) — joins home WiFi, syncs time via NTP (Madrid
-  TZ), serves a status web page (`plant-hub.local`) showing the clock, last
-  satellite check-in, last watering outcome, and two manual controls
-  ("Prueba de bomba" — run for N seconds, for calibration; "Riego manual" —
-  dose by mL). Nightly 23:00 trigger now actually commands the satellite
-  (50mL placeholder dose) instead of just logging. No web-based
-  configuration (schedule editing, satellite registry, LEDs) yet.
+  TZ), serves a web page (`plant-hub.local`) that's become the real control
+  surface for the system:
+  - **Satellite registry, persisted to flash** (NVS via `Preferences`) —
+    a satellite auto-registers into a free slot (of 4) the moment its
+    first check-in arrives, no manual "add" step. Each gets a card of its
+    own on the page: live status dot (green *En línea* / amber
+    *Esperando confirmación* while a command is in flight and check-ins
+    have naturally paused / grey *Sin conexión* if genuinely stale — red
+    is reserved for a future fault alarm, unused so far), last-seen and
+    last-watered times (humanized: seconds → minutes → hours → days), a
+    rename control (MAC tucked into an "Ajustes" panel, not shown by
+    default), manual "Regar ahora" (mL) and "Probar" (fixed 5s) buttons,
+    and a "Historial reciente" table (newest-first, last 10 events,
+    always visible even with zero entries).
+  - **Per-slot scheduling, not one dose for the whole satellite** — each
+    satellite has up to 3 independent time slots, each with its own
+    enable flag, time-of-day, *and dose in mL*. This is deliberate: more
+    water at night, a light midday top-up on hot days, spread across the
+    day to avoid pooling, all on one pump. The collapsed "Editar horario"
+    summary shows the count of active slots and the *summed* daily total
+    so you don't have to expand it to sanity-check the day's dosing.
+  - **Live status without full reloads** — the page polls a small
+    `/status.json` endpoint every 5s and patches just the status
+    dot/label/last-seen/last-watered/history-table text by element id.
+    Deliberately never touches the schedule/rename forms, so it can't
+    interrupt an in-progress edit the way a full-page auto-refresh would.
+    The header card is itself a plain link back to `/` (a full reload) —
+    easier to hit than the browser's own refresh button, especially on
+    mobile; only applies its hover shadow under `(hover: hover)` so it
+    doesn't trigger iOS Safari's "first tap just activates hover" quirk.
   - **Power-outage resilience**: WiFi connection is bounded (8s per
     attempt) and retried every 30s if it fails, rather than blocking
     forever — ESP-NOW/satellite control initializes *before* any WiFi
-    attempt, so the hub can still command the satellite even if the router
-    isn't back yet after a power cut. Similarly, NTP sync is retried every
-    30s once WiFi is up (covers the router-up-before-internet-up case).
-    Until time syncs, the hub runs a free-running fallback clock starting
-    at 00:00:00 at boot, so the nightly schedule still fires on *some*
-    cadence rather than not at all — the web page shows "Hora estimada
-    (sin sincronizar)" in that state so it's never ambiguous which mode
-    it's in. Caveat: no battery-backed RTC, so this fallback clock resets
-    to 00:00 on every reboot without network access — fine for a single
-    outage, but repeated power blips during one outage would drift it.
+    attempt, so the hub can still command satellites even if the router
+    isn't back yet after a power cut. NTP sync is retried every 30s once
+    WiFi is up (covers the router-up-before-internet-up case). Until time
+    syncs, the hub runs a free-running fallback clock starting at
+    00:00:00 at boot, so the schedule still fires on *some* cadence
+    rather than not at all — the page shows "Hora estimada (sin
+    sincronizar)" in that state. Caveat: no battery-backed RTC, so this
+    fallback resets to 00:00 on every reboot without network access.
 - **Pump satellite** (`firmware/pump-satellite/`) — one board built and
   proven, running the real protocol: periodic check-in → hub decides
-  run-or-not and replies with a duration → satellite runs the relay for
-  that duration → reports the outcome back. No deep sleep (intentional,
-  see Power). No calibration *step* in firmware yet — flow rate
-  (12.5mL/s, see Reservoir tracking) was measured manually and hardcoded
-  on the hub, not self-calibrated by the satellite. No INA219 dry-run
-  detection yet. Only 1 of the 2 v1 pump satellites is built; the plan is
-  to clone this satellite's wiring+firmware onto the second next.
-  - **ESP-NOW reliability quirks found and worked around**: (1) the
-    ESP-NOW recv callback must stay fast — calling `delay()` or
-    `esp_now_send()` from inside it (as the first draft did) silently
-    breaks the stack; the actual pump run is deferred to `loop()` instead.
-    (2) Individual sends occasionally just don't land (no error, packet
-    never arrives) — the satellite now sends its post-run report 3x with a
-    short gap as cheap insurance. (3) A run lasting ≥ the 5s check-in
-    interval used to make `loop()` fire a check-in immediately after the
-    report send, back-to-back in the same iteration — the SDK drops one of
-    the two rather than queuing it. Fixed by resetting the check-in timer
-    after a run.
+  run-or-not and sends a command (with a unique id) → satellite runs the
+  relay for that duration → sends a report tagged with that id, retried
+  every 2s until the hub acks it (satellite gives up after 5 min, harmless
+  since watering happens at most 3x/day) → hub acks, dedupes retried
+  reports by command id, logs one history entry. No deep sleep
+  (intentional, see Power). No calibration *step* in firmware yet — flow
+  rate (12.5mL/s, see Reservoir tracking) was measured manually and
+  hardcoded on the hub, not self-calibrated by the satellite. No INA219
+  dry-run detection yet. Only 1 of the 2 v1 pump satellites is built.
+  - **Reliability quirks found and fixed, roughly in the order they bit**:
+    (1) the ESP-NOW recv callback must stay fast — calling `delay()` or
+    `esp_now_send()` from inside it silently breaks the stack; the actual
+    pump run is deferred to `loop()`. (2) Individual sends occasionally
+    just don't land — both the report and the command are now sent with
+    short-gap redundancy. (3) A run ≥ the check-in interval used to make
+    `loop()` fire a check-in immediately after the report send,
+    back-to-back in one iteration — the SDK drops one; fixed by resetting
+    the check-in timer after a run. (4) The redundant command resends
+    weren't deduped on the satellite side, so a second copy arriving
+    mid-run queued a second watering right after the first — fixed with
+    the same commandId-dedupe pattern already used for reports. (5) **A
+    real overflow bug, not just a quirk**: `runMs`/`ranMs` were `uint16_t`
+    (max 65,535ms ≈ 65s ≈ 819mL at this flow rate) — raising the UI's mL
+    cap to 5000 without widening this backing type meant any dose above
+    ~819mL silently computed garbage. Fixed by widening the field to
+    `uint32_t` on **both** ends of the wire protocol — a reminder that
+    struct-based ESP-NOW messages need type widths checked against actual
+    UI-exposed ranges, and that changing them requires reflashing hub and
+    satellite together (they must agree on `sizeof()` for the length
+    check in `onEspNowRecv` to keep passing).
 - **Monitor satellite** — not started (deferred past v1 anyway, see
   Overview).
 - **Channel-pinning**: both hub and satellite pin a fixed WiFi channel (1,
@@ -73,6 +107,14 @@ pump satellites — see Overview below; only 1 is built so far):
   (antenna board = hub, relay/pump-wired board = satellite) before
   flashing, e.g. by unplugging one board and checking which `/dev/ttyUSB*`
   disappears, rather than assuming port continuity.
+- **Persistence gotcha**: `SatelliteConfig` is saved as one fixed-size
+  binary blob under a single NVS key (see firmware.md). Any change to the
+  struct's fields (adding `name`, splitting `doseMl` into per-slot
+  `slotDoseMl[3]`, etc.) changes its `sizeof()`, which fails the loader's
+  size check and silently resets *all* satellite config to defaults on
+  next boot — happened more than once today. Not data-corrupting, just
+  something to expect (and warn about) whenever a `SatelliteConfig` field
+  changes.
 
 ## Overview
 

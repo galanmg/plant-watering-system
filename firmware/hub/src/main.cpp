@@ -3,6 +3,7 @@
 #include <ESPmDNS.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Preferences.h>
 #include <time.h>
 #include "secrets.h"
 #include "web_ui.h"
@@ -19,19 +20,25 @@ const char *MDNS_HOSTNAME = "plant-hub";
 // works from boot, independent of whether the home router is reachable.
 const int WIFI_CHANNEL = 1;
 
-const int WATER_HOUR = 23;
-const int WATER_MINUTE = 0;
 const unsigned long SCHEDULE_CHECK_INTERVAL_MS = 30000;
+// A satellite that hasn't checked in within this window shows offline
+// (grey) rather than online (green) — a few missed 5s check-ins' worth of
+// slack, since individual ESP-NOW sends occasionally just don't land.
+const unsigned long SATELLITE_OFFLINE_MS = 20000;
 
 // Measured 2026-08-06: 125mL over a 10s run (tube pre-primed), through
 // ~80cm of tubing/head — matches the real deployment geometry, not a
-// zero-head bench number. Single pump/satellite for now; will need to
-// move to a per-satellite value in the hub registry once more than one
-// pump exists (different pumps/tubing runs will vary).
+// zero-head bench number. Shared across satellites for now; move to a
+// per-satellite value once different pumps/tubing runs need different
+// numbers.
 const bool FLOW_RATE_CALIBRATED = true;
 const float FLOW_RATE_ML_PER_SEC = 12.5;
 
-int lastWateredDayIndex = -1;
+// Fixed duration for the "Probar" button — a quick sanity check, not
+// meant to dose a real amount, so no point exposing it as an editable
+// field.
+const int TEST_RUN_SECONDS = 5;
+
 unsigned long lastScheduleCheckMs = 0;
 
 // After a power cut, the router/modem often isn't back yet by the time
@@ -46,6 +53,7 @@ unsigned long lastTimeSyncAttemptMs = 0;
 const unsigned long TIME_SYNC_RETRY_INTERVAL_MS = 30000;
 
 WebServer server(80);
+Preferences prefs;
 
 // --- ESP-NOW protocol (kept in sync by hand with
 // firmware/pump-satellite/src/main.cpp — small enough that a shared header
@@ -54,6 +62,7 @@ enum : uint8_t {
   MSG_CHECK_IN = 1,
   MSG_COMMAND = 2,
   MSG_REPORT = 3,
+  MSG_ACK = 4,
 };
 struct CheckInMsg {
   uint8_t type;
@@ -61,25 +70,88 @@ struct CheckInMsg {
 };
 struct CommandMsg {
   uint8_t type;
-  uint16_t runMs;
+  uint32_t commandId;
+  uint32_t runMs;
 };
 struct ReportMsg {
   uint8_t type;
-  uint16_t ranMs;
+  uint32_t commandId;
+  uint32_t ranMs;
+};
+struct AckMsg {
+  uint8_t type;
+  uint32_t commandId;
 };
 
-// Single unnamed satellite, no registry yet — a fresh check-in just
-// overwrites this. Fine while there's exactly one satellite; will need a
-// real MAC-keyed registry once a second one is cloned in.
-bool satelliteKnown = false;
-uint8_t satelliteMac[6];
-String lastSatelliteMacStr = "";
-unsigned long lastSatelliteMillis = 0;
-uint32_t lastSatelliteCounter = 0;
+uint32_t nextCommandId = 1;
 
-bool hasReport = false;
-unsigned long lastReportMillis = 0;
-uint16_t lastReportRanMs = 0;
+// Deferred send from the recv callback to loop() — never send from inside
+// the callback itself, see firmware/pump-satellite's comment on the same
+// issue.
+struct PendingAck {
+  bool pending;
+  uint8_t mac[6];
+  uint32_t commandId;
+};
+
+// --- Satellite registry — persisted to flash (NVS via Preferences) so
+// dose/schedule survive a reboot. A satellite is auto-registered into the
+// first free slot the moment its first check-in arrives; nothing here
+// requires the web UI to "add" one manually. ---
+const int MAX_SATELLITES = 4;
+struct SatelliteConfig {
+  bool inUse;
+  uint8_t mac[6];
+  char name[24];  // empty until renamed — falls back to "Satélite N"
+  bool slotEnabled[3];
+  uint8_t slotHour[3];
+  uint8_t slotMinute[3];
+  float slotDoseMl[3];  // independent per slot — more at night, less at
+                         // midday, etc., rather than one dose for all.
+};
+SatelliteConfig satellites[MAX_SATELLITES];
+long lastWateredDayIndex[MAX_SATELLITES][3];
+
+// Live status — not persisted, resets each boot (that's fine, it's
+// "am I hearing from it right now", not configuration).
+struct SatelliteRuntime {
+  bool everSeen;
+  unsigned long lastSeenMillis;
+  uint32_t lastCounter;
+  bool hasReport;
+  unsigned long lastReportMillis;
+  uint32_t lastReportRanMs;
+  uint32_t lastReportCommandId;  // dedupes retried reports before our ack lands
+  bool hasLastCommandId;
+};
+SatelliteRuntime satRuntime[MAX_SATELLITES];
+PendingAck pendingAcks[MAX_SATELLITES];
+
+// While a satellite is running the pump + retrying its report, it can't
+// send check-ins (its loop() is blocked/busy) — so "last seen" naturally
+// goes stale during a perfectly normal run. Without this, the status dot
+// would misleadingly flip to offline right when a watering is in
+// progress. Cleared the instant a report arrives; times out on its own
+// if one never does, so a genuinely dead satellite still ends up showing
+// offline rather than "waiting" forever.
+bool awaitingReport[MAX_SATELLITES];
+unsigned long commandSentMillis[MAX_SATELLITES];
+const unsigned long AWAITING_REPORT_DISPLAY_TIMEOUT_MS = 90000;
+
+// Short in-memory history per satellite — not the full 45-day flash log
+// from architecture.md's Reservoir tracking (that's a separate, bigger
+// feature), just enough to see recent activity on the page. Resets on
+// reboot.
+const int HISTORY_PER_SATELLITE = 10;
+struct WateringEvent {
+  bool valid;
+  uint32_t commandId;
+  uint32_t ranMs;
+  int hour, minute;  // wall-clock (or fallback clock) at report time
+  bool wasSynced;    // whether hour/minute above is real time or fallback
+};
+WateringEvent history[MAX_SATELLITES][HISTORY_PER_SATELLITE];
+int historyNext[MAX_SATELLITES];
 
 // Temporary raw diagnostics — records every ESP-NOW packet regardless of
 // whether it parses, so we can see what's arriving from the web page
@@ -93,7 +165,7 @@ String debugHubMac = "";
 
 // Wall-clock hour/minute/second, from real synced time when available or
 // a free-running fallback (starts at 00:00:00 at boot) when not — see
-// getCurrentTime(). dayIndex is only for the schedule's "already watered
+// getCurrentTime(). dayIndex is only for the "already watered this slot
 // today" guard; it's not a real calendar day when unsynced, just a
 // monotonic counter that changes once every 24h of uptime.
 struct SimpleTime {
@@ -124,6 +196,66 @@ SimpleTime getCurrentTime() {
   return t;
 }
 
+void addHistory(int satIdx, uint32_t commandId, uint32_t ranMs) {
+  SimpleTime t = getCurrentTime();
+  int slot = historyNext[satIdx];
+  history[satIdx][slot] = {true, commandId, ranMs, t.hour, t.minute,
+                            timeSynced};
+  historyNext[satIdx] = (slot + 1) % HISTORY_PER_SATELLITE;
+}
+
+void loadSatelliteConfigs() {
+  prefs.begin("satcfg", true);
+  size_t len = prefs.getBytesLength("cfg");
+  if (len == sizeof(satellites)) {
+    prefs.getBytes("cfg", satellites, sizeof(satellites));
+  } else {
+    memset(satellites, 0, sizeof(satellites));
+  }
+  prefs.end();
+}
+
+void saveSatelliteConfigs() {
+  prefs.begin("satcfg", false);
+  prefs.putBytes("cfg", satellites, sizeof(satellites));
+  prefs.end();
+}
+
+int findSatelliteIndex(const uint8_t *mac) {
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    if (satellites[i].inUse && memcmp(satellites[i].mac, mac, 6) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Returns the satellite's registry index, registering it with default
+// (disabled) schedule slots on first-ever check-in.
+int registerSatellite(const uint8_t *mac) {
+  int idx = findSatelliteIndex(mac);
+  if (idx >= 0) return idx;
+
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    if (!satellites[i].inUse) {
+      satellites[i].inUse = true;
+      memcpy(satellites[i].mac, mac, 6);
+      satellites[i].name[0] = '\0';
+      for (int s = 0; s < 3; s++) {
+        satellites[i].slotEnabled[s] = false;
+        satellites[i].slotHour[s] = 23;
+        satellites[i].slotMinute[s] = 0;
+        satellites[i].slotDoseMl[s] = 50.0;
+      }
+      saveSatelliteConfigs();
+      Serial.printf("Registered new satellite in slot %d\n", i);
+      return i;
+    }
+  }
+  Serial.println("Satellite registry full — ignoring new satellite");
+  return -1;
+}
+
 void ensurePeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) return;
   esp_now_peer_info_t peer = {};
@@ -135,32 +267,30 @@ void ensurePeer(const uint8_t *mac) {
   }
 }
 
-void sendCommand(const uint8_t *mac, uint16_t runMs) {
+void sendCommand(const uint8_t *mac, uint32_t runMs) {
   ensurePeer(mac);
-  CommandMsg cmd{MSG_COMMAND, runMs};
-  esp_err_t result = esp_now_send(mac, (uint8_t *)&cmd, sizeof(cmd));
-  Serial.printf("Sent command: run %ums (%s)\n", runMs,
-                result == ESP_OK ? "queued" : "error");
+  uint32_t commandId = nextCommandId++;
+  CommandMsg cmd{MSG_COMMAND, commandId, runMs};
+  // Sent 2x — cheap insurance against the same occasional dropped-packet
+  // issue the report side has; the satellite dedupes retried reports by
+  // commandId so a duplicate command is harmless (just runs once, since
+  // the satellite only starts a new run instruction, not accumulates).
+  for (int i = 0; i < 2; i++) {
+    esp_err_t result = esp_now_send(mac, (uint8_t *)&cmd, sizeof(cmd));
+    Serial.printf("Sent command #%u: run %ums (%s)\n", commandId, runMs,
+                  result == ESP_OK ? "queued" : "error");
+    delay(150);
+  }
+
+  int idx = findSatelliteIndex(mac);
+  if (idx >= 0) {
+    awaitingReport[idx] = true;
+    commandSentMillis[idx] = millis();
+  }
 }
 
-// mL -> ms using the flow-rate constant above. Uncalibrated readings are
-// still sent (better to see it run than silently do nothing), just flagged
-// in the serial log so a wrong dose is obvious while testing.
-void waterMl(float ml) {
-  if (!satelliteKnown) {
-    Serial.println("Water request ignored: no satellite has checked in yet");
-    return;
-  }
-  uint16_t runMs = (uint16_t)((ml / FLOW_RATE_ML_PER_SEC) * 1000.0);
-  if (!FLOW_RATE_CALIBRATED) {
-    Serial.println("(flow rate not calibrated yet — dose will be off)");
-  }
-  sendCommand(satelliteMac, runMs);
-}
-
-void waterNow() {
-  // Placeholder dose until a real per-reservoir schedule/registry exists.
-  waterMl(50.0);
+uint32_t mlToRunMs(float ml) {
+  return (uint32_t)((ml / FLOW_RATE_ML_PER_SEC) * 1000.0);
 }
 
 void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
@@ -178,24 +308,41 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (type == MSG_CHECK_IN && len == sizeof(CheckInMsg)) {
     CheckInMsg msg;
     memcpy(&msg, data, sizeof(msg));
-
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],
-             mac[1], mac[2], mac[3], mac[4], mac[5]);
-    memcpy(satelliteMac, mac, 6);
-    satelliteKnown = true;
-    lastSatelliteMacStr = macStr;
-    lastSatelliteMillis = millis();
-    lastSatelliteCounter = msg.counter;
-    Serial.printf("Check-in #%u from %s\n", msg.counter, macStr);
+    int idx = registerSatellite(mac);
+    if (idx >= 0) {
+      satRuntime[idx].everSeen = true;
+      satRuntime[idx].lastSeenMillis = millis();
+      satRuntime[idx].lastCounter = msg.counter;
+    }
+    Serial.printf("Check-in #%u from %s (slot %d)\n", msg.counter, dbgMac,
+                  idx);
 
   } else if (type == MSG_REPORT && len == sizeof(ReportMsg)) {
     ReportMsg msg;
     memcpy(&msg, data, sizeof(msg));
-    hasReport = true;
-    lastReportMillis = millis();
-    lastReportRanMs = msg.ranMs;
-    Serial.printf("Report: ran %ums\n", msg.ranMs);
+    int idx = findSatelliteIndex(mac);
+    if (idx >= 0) {
+      // The satellite retries this send until it hears our ack, so the
+      // same commandId can arrive more than once — only record history
+      // once per commandId, but always re-queue the ack (ours may have
+      // been the one that got dropped).
+      bool isNew = !satRuntime[idx].hasLastCommandId ||
+                   satRuntime[idx].lastReportCommandId != msg.commandId;
+      satRuntime[idx].hasReport = true;
+      satRuntime[idx].lastReportMillis = millis();
+      satRuntime[idx].lastReportRanMs = msg.ranMs;
+      satRuntime[idx].lastReportCommandId = msg.commandId;
+      satRuntime[idx].hasLastCommandId = true;
+      awaitingReport[idx] = false;
+      if (isNew) {
+        addHistory(idx, msg.commandId, msg.ranMs);
+      }
+      pendingAcks[idx].pending = true;
+      memcpy(pendingAcks[idx].mac, mac, 6);
+      pendingAcks[idx].commandId = msg.commandId;
+    }
+    Serial.printf("Report from %s: command #%u ran %ums\n", dbgMac,
+                  msg.commandId, msg.ranMs);
 
   } else {
     Serial.printf("Ignored ESP-NOW message: type=%d len=%d\n", type, len);
@@ -232,6 +379,197 @@ void tryConnectWifi() {
   }
 }
 
+String macToString(const uint8_t *mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1],
+           mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+String satelliteDisplayName(int idx) {
+  if (satellites[idx].name[0] != '\0') return String(satellites[idx].name);
+  return "Satélite " + String(idx + 1);
+}
+
+// Estimated mL for a given run duration, using the shared calibrated flow
+// rate — the whole point being that this is what a person reads, not a
+// duration they'd have to mentally convert (and which means a different
+// amount on a different pump anyway).
+float runMsToMl(uint32_t runMs) {
+  return (runMs / 1000.0) * FLOW_RATE_ML_PER_SEC;
+}
+
+// Shared by the full-page render and /status.json — walks satellite i's
+// history ring buffer newest-to-oldest and hands each valid entry to cb.
+template <typename Cb>
+void forEachHistoryEntry(int i, Cb cb) {
+  for (int h = 0; h < HISTORY_PER_SATELLITE; h++) {
+    int slot = (historyNext[i] - 1 - h + 2 * HISTORY_PER_SATELLITE) %
+               HISTORY_PER_SATELLITE;
+    if (!history[i][slot].valid) continue;
+    char timeBuf[6];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", history[i][slot].hour,
+              history[i][slot].minute);
+    cb(String(timeBuf), history[i][slot].wasSynced,
+       (int)round(runMsToMl(history[i][slot].ranMs)));
+  }
+}
+
+// Shared by the full-page render and the /status.json poll endpoint, so
+// the two can never disagree about what "online" means.
+struct SatStatusDisplay {
+  String dotClass;
+  String label;
+  String lastSeenText;
+  String lastWaterText;
+};
+
+// "hace Ns" only reads well for the first minute — past that, scale up
+// to the largest sensible unit (minutes, then hours, then days) rather
+// than showing a raw, hard-to-parse second count.
+String formatAgo(unsigned long ageSec) {
+  if (ageSec < 60) return "hace " + String(ageSec) + "s";
+  if (ageSec < 3600) return "hace " + String(ageSec / 60) + " min";
+  if (ageSec < 86400) return "hace " + String(ageSec / 3600) + " h";
+  return "hace " + String(ageSec / 86400) + " d";
+}
+
+SatStatusDisplay computeSatStatus(int i) {
+  SatStatusDisplay d;
+  unsigned long age = millis() - satRuntime[i].lastSeenMillis;
+  bool freshCheckIn = satRuntime[i].everSeen && age <= SATELLITE_OFFLINE_MS;
+  bool waiting = awaitingReport[i] &&
+                 (millis() - commandSentMillis[i]) <=
+                     AWAITING_REPORT_DISPLAY_TIMEOUT_MS;
+  // Fault (red, --status-critical) is reserved for a future dry-run/
+  // current-sensing alarm — nothing sets it yet.
+  if (waiting) {
+    d.dotClass = "dot-waiting";
+    d.label = "Esperando confirmación";
+  } else if (freshCheckIn) {
+    d.dotClass = "dot-online";
+    d.label = "En línea";
+  } else {
+    d.dotClass = "dot-offline";
+    d.label = "Sin conexión";
+  }
+
+  d.lastSeenText = satRuntime[i].everSeen ? formatAgo(age / 1000)
+                                           : "(ninguna aún)";
+
+  if (satRuntime[i].hasReport) {
+    unsigned long rAge = (millis() - satRuntime[i].lastReportMillis) / 1000;
+    d.lastWaterText =
+        "~" + String((int)round(runMsToMl(satRuntime[i].lastReportRanMs))) +
+        " mL · " + formatAgo(rAge);
+  } else {
+    d.lastWaterText = "(ninguno aún)";
+  }
+  return d;
+}
+
+void renderSatellites(String &body) {
+  bool any = false;
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    if (!satellites[i].inUse) continue;
+    any = true;
+
+    SatStatusDisplay st = computeSatStatus(i);
+
+    body += "<div class='card sat-card'>";
+    body += "<p class='sat-title'><span class='status-dot " + st.dotClass +
+            "' id='dot-" + String(i) + "'></span>" + satelliteDisplayName(i) +
+            " — <span id='label-" + String(i) + "'>" + st.label + "</span></p>";
+
+    body += "<p class='sat-meta' id='lastseen-" + String(i) +
+            "'>Última conexión: " + st.lastSeenText + "</p>";
+    body += "<p class='sat-meta' id='lastwater-" + String(i) +
+            "'>Último riego: " + st.lastWaterText + "</p>";
+
+    int activeSlots = 0;
+    float totalMl = 0;
+    for (int s = 0; s < 3; s++) {
+      if (satellites[i].slotEnabled[s]) {
+        activeSlots++;
+        totalMl += satellites[i].slotDoseMl[s];
+      }
+    }
+    body += "<p class='sat-meta' style='margin-top:8px'>Riegos activos: " +
+            String(activeSlots) + " · Total al día: " +
+            String((int)totalMl) + " mL</p>";
+
+    body += F("<details><summary>Editar horario</summary>");
+    body += "<form action='/satellite/save' method='get'>";
+    body += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+    for (int s = 0; s < 3; s++) {
+      char timeVal[6];
+      snprintf(timeVal, sizeof(timeVal), "%02d:%02d", satellites[i].slotHour[s],
+                satellites[i].slotMinute[s]);
+      body += "<div class='slot-row'><input type='checkbox' name='e" +
+              String(s) + "'" +
+              (satellites[i].slotEnabled[s] ? " checked" : "") +
+              "> Horario " + String(s + 1) +
+              " <input type='time' name='t" + String(s) + "' value='" +
+              timeVal + "'>"
+              " <input type='number' name='ml" + String(s) + "' value='" +
+              String((int)satellites[i].slotDoseMl[s]) +
+              "' min='1' max='5000' style='width:90px'> mL</div>";
+    }
+    body += "<button type='submit'>Guardar horario</button>";
+    body += F("</form></details>");
+
+    body += F("<div class='action-row'>");
+    body += "<form action='/satellite/water' method='get'>";
+    body += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+    body +=
+        "<div class='slot-row'><input type='number' name='ml' value='50' "
+        "min='1' max='5000' style='width:90px'> mL "
+        "<button type='submit'>Regar ahora</button></div>";
+    body += "</form>";
+
+    body += "<form action='/satellite/test' method='get'>";
+    body += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+    body += F("<button type='submit'>Probar</button>");
+    body += "</form>";
+    body += F("</div>");
+
+    String rowsHtml;
+    forEachHistoryEntry(i, [&](String t, bool synced, int ml) {
+      rowsHtml += "<tr><td>" + t + (synced ? "" : "*") + "</td><td>~" +
+                  String(ml) + " mL</td></tr>";
+    });
+
+    body += F("<div class='button-row'>");
+    body += F("<details><summary>Ajustes</summary>");
+    body += "<form action='/satellite/rename' method='get'>";
+    body += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+    body += "<div class='slot-row'>Nombre <input type='text' name='name' value='" +
+            satelliteDisplayName(i) + "' maxlength='23' style='width:140px'></div>";
+    body += "<button type='submit'>Guardar nombre</button>";
+    body += "</form>";
+    body += "<p class='sat-meta' style='margin-top:8px'>MAC: " +
+            macToString(satellites[i].mac) + "</p>";
+    body += F("</details>");
+    // Always rendered, even with zero entries — so it's not there one
+    // reload and gone the next; the poll (see below) fills it in live
+    // once the first watering happens, no manual reload needed.
+    body += "<details><summary>Historial reciente</summary>"
+            "<table id='history-" + String(i) + "'><tr><th>Hora</th><th>Cantidad</th></tr>";
+    body += rowsHtml;
+    body += F("</table></details>");
+    body += F("</div>");
+
+    body += "</div>";
+  }
+
+  if (!any) {
+    body += F(
+        "<div class='card'><p class='stat-label'>Satélites</p>"
+        "<p class='stat-value' style='font-size:1.25rem'>(ninguno aún)</p>"
+        "</div>");
+  }
+}
+
 void handleRoot() {
   SimpleTime now = getCurrentTime();
   char timeStr[9];
@@ -239,14 +577,22 @@ void handleRoot() {
            now.second);
 
   String body;
+  body.reserve(3500);
+
+  // The whole card is a plain link to "/" — tapping it anywhere just
+  // reloads the page. Easier to hit than the browser's own tiny refresh
+  // button, especially on mobile.
+  body += F("<a href='/' class='card header-card'>");
   body += F("<h1>Sistema de riego</h1>");
   body += "<p class='stat-label'>" +
           String(timeSynced ? "Hora sincronizada"
                              : "Hora estimada (sin sincronizar)") +
           "</p>";
   body += "<p class='stat-value' id='clock'>" + String(timeStr) + "</p>";
+  body += F("</a>");
   // Ticks the displayed clock forward locally every second so the page
   // doesn't look frozen between reloads — no server polling involved.
+  // Kept outside the <a> above (script isn't valid link content).
   body += F(
       "<script>"
       "(function(){"
@@ -262,78 +608,137 @@ void handleRoot() {
       "})();"
       "</script>");
 
-  body += F("<p class='stat-label' style='margin-top:24px'>Último satélite</p>");
-  if (!satelliteKnown) {
-    body += F("<p class='stat-value' style='font-size:1.25rem'>(ninguno aún)</p>");
-  } else {
-    unsigned long secsAgo = (millis() - lastSatelliteMillis) / 1000;
-    body += "<p class='stat-value' style='font-size:1.25rem'>" +
-            lastSatelliteMacStr + " · hace " + String(secsAgo) + "s</p>";
-  }
+  renderSatellites(body);
 
-  body += F("<p class='stat-label' style='margin-top:24px'>Último riego</p>");
-  if (!hasReport) {
-    body += F("<p class='stat-value' style='font-size:1.25rem'>(ninguno aún)</p>");
-  } else {
-    unsigned long secsAgo = (millis() - lastReportMillis) / 1000;
-    body += "<p class='stat-value' style='font-size:1.25rem'>" +
-            String(lastReportRanMs) + " ms · hace " + String(secsAgo) +
-            "s</p>";
-  }
-
-  body += "<p class='stat-label' style='margin-top:24px'>Debug ESP-NOW</p>"
-          "<p class='stat-value' style='font-size:1rem'>wifi=" +
+  body += "<details><summary>Debug ESP-NOW</summary><p class='sat-meta'>wifi=" +
           String(wifiConnected ? "ok" : "esperando") + " horaSync=" +
           String(timeSynced ? "ok" : "no") + " init=" +
           String(debugEspNowInitOk ? "ok" : "FAIL") + " hubMac=" +
           debugHubMac + " canal=" + String(WiFi.channel()) + " vistos=" +
           String(debugPacketsSeen) + " tipo=" + String(debugLastType) +
           " len=" + String(debugLastLen) + " remitente=" +
-          (debugLastMac.length() ? debugLastMac : "-") +
-          " satCheckInCounter=" + String(lastSatelliteCounter) + "</p>";
+          (debugLastMac.length() ? debugLastMac : "-") + "</p></details>";
 
+  // Polls /status.json every 5s and patches only the status dot/label/
+  // last-seen/last-water text by id — never touches the schedule forms,
+  // so it can't interrupt someone mid-edit.
   body += F(
-      "<p class='stat-label' style='margin-top:24px'>Prueba de bomba "
-      "(calibración)</p>"
-      "<form action='/test' method='get' style='margin-top:4px'>"
-      "<input type='number' name='seconds' value='3' min='1' max='30' "
-      "style='width:60px'> segundos "
-      "<button type='submit'>Probar</button>"
-      "</form>");
-
-  body += "<p class='stat-label' style='margin-top:24px'>Riego manual";
-  if (!FLOW_RATE_CALIBRATED) body += " (sin calibrar)";
-  body += F(
-      "</p>"
-      "<form action='/water' method='get' style='margin-top:4px'>"
-      "<input type='number' name='ml' value='50' min='1' max='1000' "
-      "style='width:70px'> mL "
-      "<button type='submit'>Regar</button>"
-      "</form>");
+      "<script>"
+      "setInterval(function(){"
+      "fetch('/status.json').then(function(r){return r.json();})"
+      ".then(function(data){"
+      "data.satellites.forEach(function(s){"
+      "var dot=document.getElementById('dot-'+s.idx);"
+      "if(dot)dot.className='status-dot '+s.dotClass;"
+      "var label=document.getElementById('label-'+s.idx);"
+      "if(label)label.textContent=s.label;"
+      "var seen=document.getElementById('lastseen-'+s.idx);"
+      "if(seen)seen.textContent='Última conexión: '+s.lastSeenText;"
+      "var water=document.getElementById('lastwater-'+s.idx);"
+      "if(water)water.textContent='Último riego: '+s.lastWaterText;"
+      "var hist=document.getElementById('history-'+s.idx);"
+      "if(hist)hist.innerHTML='<tr><th>Hora</th><th>Cantidad</th></tr>'+s.historyRows;"
+      "});"
+      "}).catch(function(){});"
+      "},5000);"
+      "</script>");
 
   server.send(200, "text/html", pageShell("Sistema de riego", body));
 }
 
-void handleTest() {
-  int seconds = server.arg("seconds").toInt();
-  if (seconds < 1) seconds = 1;
-  if (satelliteKnown) {
-    sendCommand(satelliteMac, seconds * 1000);
+// Polled by the page's own JS every few seconds to refresh just the
+// status dot/label/last-seen/last-water text — not a full page reload, so
+// it never disturbs an in-progress schedule edit. All the interpolated
+// text here is server-computed (numbers, fixed labels), never user input,
+// so no JSON escaping is needed.
+void handleStatusJson() {
+  String json = "{\"satellites\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    if (!satellites[i].inUse) continue;
+    if (!first) json += ",";
+    first = false;
+    SatStatusDisplay st = computeSatStatus(i);
+    String rowsHtml;
+    forEachHistoryEntry(i, [&](String t, bool synced, int ml) {
+      rowsHtml += "<tr><td>" + t + (synced ? "" : "*") + "</td><td>~" +
+                  String(ml) + " mL</td></tr>";
+    });
+    rowsHtml.replace("\"", "\\\"");
+    json += "{\"idx\":" + String(i) + ",\"dotClass\":\"" + st.dotClass +
+            "\",\"label\":\"" + st.label + "\",\"lastSeenText\":\"" +
+            st.lastSeenText + "\",\"lastWaterText\":\"" + st.lastWaterText +
+            "\",\"historyRows\":\"" + rowsHtml + "\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleSatelliteRename() {
+  int idx = server.arg("idx").toInt();
+  if (idx >= 0 && idx < MAX_SATELLITES && satellites[idx].inUse) {
+    String name = server.arg("name");
+    name.trim();
+    strncpy(satellites[idx].name, name.c_str(), sizeof(satellites[idx].name) - 1);
+    satellites[idx].name[sizeof(satellites[idx].name) - 1] = '\0';
+    saveSatelliteConfigs();
   }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-void handleWater() {
-  int ml = server.arg("ml").toInt();
+void handleSatelliteSave() {
+  int idx = server.arg("idx").toInt();
+  if (idx >= 0 && idx < MAX_SATELLITES && satellites[idx].inUse) {
+    for (int s = 0; s < 3; s++) {
+      satellites[idx].slotEnabled[s] = server.hasArg("e" + String(s));
+      String t = server.arg("t" + String(s));
+      int h = satellites[idx].slotHour[s];
+      int m = satellites[idx].slotMinute[s];
+      int colon = t.indexOf(':');
+      if (colon > 0) {
+        h = t.substring(0, colon).toInt();
+        m = t.substring(colon + 1).toInt();
+      }
+      satellites[idx].slotHour[s] = constrain(h, 0, 23);
+      satellites[idx].slotMinute[s] = constrain(m, 0, 59);
+
+      float ml = server.arg("ml" + String(s)).toFloat();
+      satellites[idx].slotDoseMl[s] = ml < 1 ? 1 : ml;
+    }
+    saveSatelliteConfigs();
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSatelliteTest() {
+  int idx = server.arg("idx").toInt();
+  if (idx >= 0 && idx < MAX_SATELLITES && satellites[idx].inUse) {
+    sendCommand(satellites[idx].mac, TEST_RUN_SECONDS * 1000);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSatelliteWater() {
+  int idx = server.arg("idx").toInt();
+  float ml = server.arg("ml").toFloat();
   if (ml < 1) ml = 1;
-  waterMl((float)ml);
+  if (idx >= 0 && idx < MAX_SATELLITES && satellites[idx].inUse) {
+    sendCommand(satellites[idx].mac, mlToRunMs(ml));
+  }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
 void setup() {
   Serial.begin(115200);
+
+  loadSatelliteConfigs();
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    for (int s = 0; s < 3; s++) lastWateredDayIndex[i][s] = -1;
+  }
 
   // ESP-NOW/satellite control must work independent of the home router —
   // set STA mode and pin the shared channel before ever attempting to
@@ -353,8 +758,11 @@ void setup() {
   }
 
   server.on("/", handleRoot);
-  server.on("/test", handleTest);
-  server.on("/water", handleWater);
+  server.on("/status.json", handleStatusJson);
+  server.on("/satellite/rename", handleSatelliteRename);
+  server.on("/satellite/save", handleSatelliteSave);
+  server.on("/satellite/test", handleSatelliteTest);
+  server.on("/satellite/water", handleSatelliteWater);
   server.begin();
   Serial.println("Web server started");
 
@@ -371,6 +779,16 @@ void loop() {
   server.handleClient();
 
   unsigned long nowMs = millis();
+
+  // Deferred from onEspNowRecv() — never send from inside that callback.
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    if (!pendingAcks[i].pending) continue;
+    pendingAcks[i].pending = false;
+    ensurePeer(pendingAcks[i].mac);
+    AckMsg ack{MSG_ACK, pendingAcks[i].commandId};
+    esp_now_send(pendingAcks[i].mac, (uint8_t *)&ack, sizeof(ack));
+    Serial.printf("Acked command #%u\n", pendingAcks[i].commandId);
+  }
 
   if (!wifiConnected && nowMs - lastWifiAttemptMs >= WIFI_RETRY_INTERVAL_MS) {
     lastWifiAttemptMs = nowMs;
@@ -394,13 +812,21 @@ void loop() {
   if (nowMs - lastScheduleCheckMs >= SCHEDULE_CHECK_INTERVAL_MS) {
     lastScheduleCheckMs = nowMs;
     SimpleTime t = getCurrentTime();
-    // Guard on dayIndex so the 1-minute match window can't fire twice.
-    // Works even unsynced: dayIndex still advances once per 24h of
-    // uptime, it just isn't tied to a real calendar date until synced.
-    if (t.hour == WATER_HOUR && t.minute == WATER_MINUTE &&
-        t.dayIndex != lastWateredDayIndex) {
-      lastWateredDayIndex = t.dayIndex;
-      waterNow();
+    for (int i = 0; i < MAX_SATELLITES; i++) {
+      if (!satellites[i].inUse) continue;
+      for (int s = 0; s < 3; s++) {
+        if (!satellites[i].slotEnabled[s]) continue;
+        // Guard on dayIndex so the 1-minute match window can't fire
+        // twice. Works even unsynced: dayIndex still advances once per
+        // 24h of uptime, it just isn't tied to a real calendar date
+        // until synced.
+        if (t.hour == satellites[i].slotHour[s] &&
+            t.minute == satellites[i].slotMinute[s] &&
+            lastWateredDayIndex[i][s] != t.dayIndex) {
+          lastWateredDayIndex[i][s] = t.dayIndex;
+          sendCommand(satellites[i].mac, mlToRunMs(satellites[i].slotDoseMl[s]));
+        }
+      }
     }
   }
 }
