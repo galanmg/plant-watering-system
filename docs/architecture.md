@@ -1,14 +1,15 @@
 # Architecture
 
-Status: hub + first pump satellite built and proven end-to-end (relay
-confirmed moving water, ESP-NOW check-in confirmed reaching the hub) —
-first physical steps toward the v1 scope below. This doc is updated as
-decisions get made — treat "Open questions" as the running to-do list. See
+Status: hub + first pump satellite built and proven end-to-end, with the
+real hub↔satellite protocol (not just a one-shot test), a measured flow
+rate, and WiFi/power-outage resilience. First physical steps toward the v1
+scope below. This doc is updated as decisions get made — treat "Open
+questions" as the running to-do list. See
 [project-overview.md](project-overview.md) for the decision log and step
 checklist, and [hardware.md](hardware.md) for the shopping list and purchase
 status.
 
-Last updated: 2026-08-04
+Last updated: 2026-08-06
 
 ## Current implementation status
 
@@ -16,29 +17,62 @@ What's actually running, as of the first satellite build (v1 target is 2
 pump satellites — see Overview below; only 1 is built so far):
 
 - **Hub** (`firmware/hub/`) — joins home WiFi, syncs time via NTP (Madrid
-  TZ), serves a status web page (`plant-hub.local`) showing synced time and
-  last satellite check-in, receives ESP-NOW messages from satellites.
-  Nightly 23:00 trigger exists but only logs to serial — **not yet wired to
-  actually command any satellite.** No web-based configuration (schedule
-  editing, satellite registry, LEDs) yet.
+  TZ), serves a status web page (`plant-hub.local`) showing the clock, last
+  satellite check-in, last watering outcome, and two manual controls
+  ("Prueba de bomba" — run for N seconds, for calibration; "Riego manual" —
+  dose by mL). Nightly 23:00 trigger now actually commands the satellite
+  (50mL placeholder dose) instead of just logging. No web-based
+  configuration (schedule editing, satellite registry, LEDs) yet.
+  - **Power-outage resilience**: WiFi connection is bounded (8s per
+    attempt) and retried every 30s if it fails, rather than blocking
+    forever — ESP-NOW/satellite control initializes *before* any WiFi
+    attempt, so the hub can still command the satellite even if the router
+    isn't back yet after a power cut. Similarly, NTP sync is retried every
+    30s once WiFi is up (covers the router-up-before-internet-up case).
+    Until time syncs, the hub runs a free-running fallback clock starting
+    at 00:00:00 at boot, so the nightly schedule still fires on *some*
+    cadence rather than not at all — the web page shows "Hora estimada
+    (sin sincronizar)" in that state so it's never ambiguous which mode
+    it's in. Caveat: no battery-backed RTC, so this fallback clock resets
+    to 00:00 on every reboot without network access — fine for a single
+    outage, but repeated power blips during one outage would drift it.
 - **Pump satellite** (`firmware/pump-satellite/`) — one board built and
-  proven: joins the ESP-NOW link on a hardcoded channel/hub MAC, sends a
-  periodic "hello" the hub displays, and drives a relay-switched pump
-  (confirmed moving water; trigger polarity empirically confirmed
-  active-HIGH, matching the Pump satellite section below). **Current
-  firmware is a one-shot test** (runs the pump once, 5s after boot, for
-  3s) — not yet the real check-in → hub-decides → run-or-not →
-  report-outcome protocol described below, and no calibration step yet.
-  Only 1 of the 2 v1 pump satellites is built; the plan is to nail this
-  one satellite's real protocol first, then clone the wiring+firmware onto
-  the second.
+  proven, running the real protocol: periodic check-in → hub decides
+  run-or-not and replies with a duration → satellite runs the relay for
+  that duration → reports the outcome back. No deep sleep (intentional,
+  see Power). No calibration *step* in firmware yet — flow rate
+  (12.5mL/s, see Reservoir tracking) was measured manually and hardcoded
+  on the hub, not self-calibrated by the satellite. No INA219 dry-run
+  detection yet. Only 1 of the 2 v1 pump satellites is built; the plan is
+  to clone this satellite's wiring+firmware onto the second next.
+  - **ESP-NOW reliability quirks found and worked around**: (1) the
+    ESP-NOW recv callback must stay fast — calling `delay()` or
+    `esp_now_send()` from inside it (as the first draft did) silently
+    breaks the stack; the actual pump run is deferred to `loop()` instead.
+    (2) Individual sends occasionally just don't land (no error, packet
+    never arrives) — the satellite now sends its post-run report 3x with a
+    short gap as cheap insurance. (3) A run lasting ≥ the 5s check-in
+    interval used to make `loop()` fire a check-in immediately after the
+    report send, back-to-back in the same iteration — the SDK drops one of
+    the two rather than queuing it. Fixed by resetting the check-in timer
+    after a run.
 - **Monitor satellite** — not started (deferred past v1 anyway, see
   Overview).
-- **Channel-pinning caveat is live, not just theoretical**: the satellite's
-  WiFi channel is hardcoded in `firmware/pump-satellite/include/config.h`
-  to match whatever channel the home router currently puts the hub on
-  (verified via `nmcli`/`iw`, not read automatically) — see the open
-  question below, still unsolved.
+- **Channel-pinning**: both hub and satellite pin a fixed WiFi channel (1,
+  matching the home router) at boot rather than relying on the hub's STA
+  connection to set it implicitly — necessary for the outage-resilience
+  behavior above (ESP-NOW must work even when the hub isn't associated to
+  the router). Still hardcoded, not auto-detected — see the open question
+  below, still unsolved if the router ever changes channel.
+- **Hardware identification gotcha (real, not hypothetical)**: Linux
+  doesn't guarantee stable `/dev/ttyUSB0`/`ttyUSB1` numbering across
+  reboots/replugs. After a reboot, firmware got flashed to the wrong
+  physical boards purely by port-number assumption (hub firmware landed on
+  the relay/pump board and vice versa) — nothing appeared broken in
+  software, the pump just silently didn't run. Always verify physically
+  (antenna board = hub, relay/pump-wired board = satellite) before
+  flashing, e.g. by unplugging one board and checking which `/dev/ttyUSB*`
+  disappears, rather than assuming port continuity.
 
 ## Overview
 

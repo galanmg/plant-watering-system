@@ -6,7 +6,13 @@
 #include <cstdint>
 
 // Hub's WiFi MAC — printed on the hub's serial log at boot as
-// "ESP-NOW ready. Hub MAC: ...".
+// "ESP-NOW ready. Hub MAC: ...", also shown on the hub's web page's Debug
+// ESP-NOW line. This is tied to the physical board's chip (the one with
+// the external U.FL antenna), not to "whichever board is plugged into
+// /dev/ttyUSB0" — Linux doesn't guarantee stable ttyUSB numbering across
+// reboots/replugs. Identify the hub board physically (antenna = hub,
+// relay/pump wiring = satellite) before flashing, not by port number.
+// Confirmed 2026-08-06 by unplug test: this is the antenna board's MAC.
 static const uint8_t HUB_MAC[6] = {0x68, 0x09, 0x47, 0x9E, 0x8A, 0x60};
 
 // Must match the WiFi channel the home router put the hub's STA connection

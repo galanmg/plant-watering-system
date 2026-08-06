@@ -3,26 +3,94 @@
 #include <esp_wifi.h>
 #include "config.h"
 
-struct SatelliteHello {
+// --- ESP-NOW protocol (kept in sync by hand with
+// firmware/hub/src/main.cpp — small enough that a shared header isn't
+// worth it yet across two separate PlatformIO projects). ---
+enum : uint8_t {
+  MSG_CHECK_IN = 1,
+  MSG_COMMAND = 2,
+  MSG_REPORT = 3,
+};
+struct CheckInMsg {
+  uint8_t type;
   uint32_t counter;
 };
+struct CommandMsg {
+  uint8_t type;
+  uint16_t runMs;
+};
+struct ReportMsg {
+  uint8_t type;
+  uint16_t ranMs;
+};
 
-uint32_t helloCounter = 0;
-unsigned long lastSendMs = 0;
-const unsigned long SEND_INTERVAL_MS = 3000;
-
-// --- Temporary one-shot pump test — confirmed relay is active-HIGH.
-// Runs the pump once, 5s after boot, for 3s. To be replaced with a real
-// run-on-command handler once this confirms water actually moves. ---
 const int RELAY_PIN = 26;
-const unsigned long PUMP_TEST_START_MS = 5000;
-const unsigned long PUMP_TEST_DURATION_MS = 3000;
-bool pumpTestStarted = false;
-bool pumpTestFinished = false;
 
-void onSent(const uint8_t *mac, esp_now_send_status_t status) {
-  Serial.printf("Send status: %s\n",
-                status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+uint32_t checkInCounter = 0;
+unsigned long lastCheckInMs = 0;
+const unsigned long CHECK_IN_INTERVAL_MS = 5000;
+
+// Set by the ESP-NOW recv callback, consumed by loop(). The callback must
+// stay fast (no delay(), no esp_now_send()) — it runs in the WiFi driver's
+// own context, and blocking or sending from inside it can wedge the
+// ESP-NOW/WiFi stack. Actually running the pump is deferred to loop().
+volatile bool pendingRun = false;
+volatile uint16_t pendingRunMs = 0;
+
+void sendCheckIn() {
+  checkInCounter++;
+  CheckInMsg msg{MSG_CHECK_IN, checkInCounter};
+  esp_err_t result = esp_now_send(HUB_MAC, (uint8_t *)&msg, sizeof(msg));
+  Serial.printf("Check-in #%u (%s)\n", checkInCounter,
+                result == ESP_OK ? "queued" : "error");
+}
+
+// Blocking on purpose: v1 runs the satellite awake full-time (no deep
+// sleep, see architecture.md's Power section), and there's nothing else
+// this board needs to do mid-run. Safe to block here — called from
+// loop(), not from the ESP-NOW callback.
+void runPump(uint16_t runMs) {
+  Serial.printf("Running pump for %ums\n", runMs);
+  digitalWrite(RELAY_PIN, HIGH);
+  delay(runMs);
+  digitalWrite(RELAY_PIN, LOW);
+  // Let any relay-switching electrical transient settle before keying the
+  // radio — suspected cause of the report send silently not landing.
+  delay(200);
+
+  ReportMsg report{MSG_REPORT, runMs};
+  // Sent 3x with a short gap — ESP-NOW delivery isn't guaranteed, and this
+  // is cheap insurance against an occasional dropped packet.
+  for (int i = 0; i < 3; i++) {
+    esp_err_t result =
+        esp_now_send(HUB_MAC, (uint8_t *)&report, sizeof(report));
+    Serial.printf("Report send attempt %d (%s)\n", i,
+                  result == ESP_OK ? "queued" : "error");
+    delay(150);
+  }
+
+  // Runs >= the check-in interval would otherwise make loop() immediately
+  // fire a check-in right after these report sends — two back-to-back
+  // esp_now_send() calls in the same loop iteration, which this SDK seems
+  // to drop rather than queue. Reset the timer so the next check-in waits
+  // its normal full interval instead.
+  lastCheckInMs = millis();
+}
+
+void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len < 1) return;
+  uint8_t type = data[0];
+
+  if (type == MSG_COMMAND && len == sizeof(CommandMsg)) {
+    CommandMsg cmd;
+    memcpy(&cmd, data, sizeof(cmd));
+    if (cmd.runMs > 0) {
+      pendingRunMs = cmd.runMs;
+      pendingRun = true;
+    }
+  } else {
+    Serial.printf("Ignored ESP-NOW message: type=%d len=%d\n", type, len);
+  }
 }
 
 void setup() {
@@ -43,7 +111,7 @@ void setup() {
     Serial.println("ESP-NOW init failed");
     return;
   }
-  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onEspNowRecv);
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, HUB_MAC, 6);
@@ -55,27 +123,14 @@ void setup() {
 }
 
 void loop() {
+  if (pendingRun) {
+    pendingRun = false;
+    runPump(pendingRunMs);
+  }
+
   unsigned long nowMs = millis();
-
-  if (!pumpTestStarted && nowMs >= PUMP_TEST_START_MS) {
-    pumpTestStarted = true;
-    digitalWrite(RELAY_PIN, HIGH);
-    Serial.println("Pump test: ON");
-  }
-  if (pumpTestStarted && !pumpTestFinished &&
-      nowMs >= PUMP_TEST_START_MS + PUMP_TEST_DURATION_MS) {
-    pumpTestFinished = true;
-    digitalWrite(RELAY_PIN, LOW);
-    Serial.println("Pump test: OFF (done)");
-  }
-
-  if (nowMs - lastSendMs >= SEND_INTERVAL_MS) {
-    lastSendMs = nowMs;
-    helloCounter++;
-    SatelliteHello msg{helloCounter};
-    esp_err_t result =
-        esp_now_send(HUB_MAC, (uint8_t *)&msg, sizeof(msg));
-    Serial.printf("Sending hello #%u (%s)\n", helloCounter,
-                  result == ESP_OK ? "queued" : "error");
+  if (nowMs - lastCheckInMs >= CHECK_IN_INTERVAL_MS) {
+    lastCheckInMs = nowMs;
+    sendCheckIn();
   }
 }

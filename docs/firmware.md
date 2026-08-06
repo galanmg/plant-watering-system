@@ -1,6 +1,8 @@
 # Firmware
 
-Status (2026-08-04): hub and one pump satellite built and flashed. See
+Status (2026-08-06): hub and one pump satellite built and flashed, running
+the real check-in/command/report protocol (not just a one-shot test), with
+a measured flow rate (12.5mL/s) and WiFi/power-outage resilience. See
 architecture.md's "Current implementation status" for what each one
 actually does today.
 
@@ -43,6 +45,35 @@ non-interactive/sandboxed shell).
   newer `esp_now_recv_info_t*`-based one some docs/examples show. Mismatch
   fails to compile with a clear pointer-type error, easy to fix once you
   know which signature the installed core version expects.
+- **`/dev/ttyUSB0`/`ttyUSB1` numbering is not stable across reboots or
+  replugs.** After a reboot, assuming "port 0 is still the hub" led to
+  flashing firmware onto the wrong physical boards — everything compiled
+  and ran, the hub even booted and served its page fine, it just silently
+  talked to itself instead of the satellite. Always confirm which port is
+  which board physically before flashing after any reboot/replug — e.g.
+  unplug one board and see which `/dev/ttyUSB*` disappears — rather than
+  trusting the port number. (Hub = the board with the antenna; satellite =
+  the board wired to the relay/pump.)
+- **Debugging without reliable serial access**: reading `/dev/ttyUSB*`
+  programmatically (not via an interactive `pio device monitor` in a real
+  terminal) was unreliable in this setup — reads intermittently returned
+  garbled or duplicated data, sometimes at a byte rate physically
+  impossible for the actual baud rate. When debugging remotely, prefer
+  exposing state via the hub's web page (it already has a "Debug ESP-NOW"
+  line with packet counts/types/senders) over trusting a scripted serial
+  capture; ask the user to check `pio device monitor` themselves in their
+  own terminal when satellite-side serial output is actually needed.
+- **ESP-NOW reliability, found while wiring up the real protocol** (see
+  architecture.md's "Current implementation status" for the fuller
+  writeup): (1) never call `delay()` or `esp_now_send()` from inside the
+  recv callback — defer to `loop()` via a pending-flag instead, or sends
+  silently misbehave. (2) Individual `esp_now_send()` calls occasionally
+  just don't arrive, no error reported — send anything that matters
+  (like a run report) 2-3x with a short gap. (3) Two `esp_now_send()`
+  calls back-to-back in the same `loop()` iteration can result in one
+  being dropped — if a blocking operation (like running a pump) can push
+  a periodic send (like a check-in) to fire immediately afterward, reset
+  that periodic timer explicitly rather than letting the two collide.
 
 ## Secrets & deployment-specific config
 
@@ -55,7 +86,7 @@ secrets.
 
 `firmware/pump-satellite/include/config.h` (hub MAC + WiFi channel) is
 *not* templated this way — it's not secret, just committed directly, since
-it's shared config all 3 pump satellites will need identically.
+it's shared config both v1 pump satellites will need identically.
 
 ## Design system (web UI)
 
