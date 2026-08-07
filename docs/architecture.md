@@ -9,7 +9,7 @@ to-do list. See [project-overview.md](project-overview.md) for the
 decision log and step checklist, and [hardware.md](hardware.md) for the
 shopping list and purchase status.
 
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 
 ## Current implementation status
 
@@ -115,6 +115,22 @@ pump satellites — see Overview below; only 1 is built so far):
   next boot — happened more than once today. Not data-corrupting, just
   something to expect (and warn about) whenever a `SatelliteConfig` field
   changes.
+- **Real bug found and fixed 2026-08-07**: the schedule appeared to
+  "randomly stop working" after some testing, while manual watering kept
+  working fine and a hub reboot temporarily fixed it. Root cause: the
+  per-slot "already watered today" guard is keyed by slot number, not by
+  the slot's configured time — editing a slot's time after it had already
+  fired that day (normal while calibrating a schedule) left the guard
+  still set, silently suppressing the new time until midnight or reboot.
+  Fixed by resetting that guard whenever a schedule is saved. Reproduced
+  and confirmed fixed by scheduling two closely-spaced test times on the
+  same slot back to back — the second only fired after the fix.
+- **`scripts/identify-boards.sh`** now exists to solve the recurring
+  `/dev/ttyUSB0`/`ttyUSB1` port-swap problem properly — reads each
+  board's real ESP32 MAC via `esptool.py read_mac` (works without the
+  firmware even booting) rather than relying on the USB-serial chip's own
+  serial number, which turned out to be a non-unique factory default
+  shared by every board of this model.
 
 ## Overview
 

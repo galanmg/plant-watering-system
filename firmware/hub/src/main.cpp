@@ -705,6 +705,14 @@ void handleSatelliteSave() {
 
       float ml = server.arg("ml" + String(s)).toFloat();
       satellites[idx].slotDoseMl[s] = ml < 1 ? 1 : ml;
+
+      // The "already watered today" guard is keyed by slot number, not by
+      // the slot's configured time — without this reset, editing a slot
+      // that already fired earlier today (e.g. while calibrating/testing
+      // a schedule) would silently suppress the new time for the rest of
+      // the day, with no indication why. Saving always makes every slot
+      // eligible again today.
+      lastWateredDayIndex[idx][s] = -1;
     }
     saveSatelliteConfigs();
   }

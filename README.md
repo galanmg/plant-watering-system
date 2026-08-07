@@ -24,12 +24,13 @@ the plants. They wither.
 
 v1 target: 1 hub + 2 pump satellites, working before early September 2026
 (see [docs/architecture.md](docs/architecture.md)'s Overview). As of
-2026-08-06: the hub runs a real live-updating web control panel — a
+2026-08-07: the hub runs a real live-updating web control panel — a
 persisted, multi-satellite registry, per-slot (up to 3x/day) independent
 scheduling with its own dose per slot, manual test/water controls, and a
 confirmed command/report/ack protocol with retries. The first pump
-satellite is fully working end to end, including a real dosing bug
-(16-bit duration overflow above ~819mL) found and fixed. See
+satellite is fully working end to end; two real bugs (a 16-bit duration
+overflow above ~819mL, and a stale "already watered today" guard that
+silently ate schedule edits) found and fixed. See
 docs/architecture.md's "Current implementation status" for the full
 writeup, and [docs/firmware.md](docs/firmware.md) for how to build/flash.
 

@@ -1,6 +1,6 @@
 # Firmware
 
-Status (2026-08-06): hub and one pump satellite built and flashed, running
+Status (2026-08-07): hub and one pump satellite built and flashed, running
 the real check-in/command/ack/report protocol, a persisted multi-satellite
 registry with per-slot (up to 3x/day) independent dosing, a live-updating
 web UI, and WiFi/power-outage resilience. See architecture.md's "Current
@@ -46,14 +46,22 @@ non-interactive/sandboxed shell).
   fails to compile with a clear pointer-type error, easy to fix once you
   know which signature the installed core version expects.
 - **`/dev/ttyUSB0`/`ttyUSB1` numbering is not stable across reboots or
-  replugs.** After a reboot, assuming "port 0 is still the hub" led to
-  flashing firmware onto the wrong physical boards — everything compiled
-  and ran, the hub even booted and served its page fine, it just silently
-  talked to itself instead of the satellite. Always confirm which port is
-  which board physically before flashing after any reboot/replug — e.g.
-  unplug one board and see which `/dev/ttyUSB*` disappears — rather than
-  trusting the port number. (Hub = the board with the antenna; satellite =
-  the board wired to the relay/pump.)
+  replugs — confirmed again on 2026-08-07, the mapping was the exact
+  opposite of the day before.** After a reboot, assuming "port 0 is still
+  the hub" led to flashing firmware onto the wrong physical boards —
+  everything compiled and ran, the hub even booted and served its page
+  fine, it just silently talked to itself instead of the satellite.
+  Run **`scripts/identify-boards.sh`** before flashing after any
+  reboot/replug — it reads each board's real hardware MAC via
+  `esptool.py read_mac` (works against the ROM bootloader, no firmware
+  needs to be running) and matches it against the known hub/satellite
+  MACs, so no unplug-and-check-what-disappears dance is needed. Note the
+  CP2102 USB-serial chips on these boards report the *same* generic
+  factory serial (`0001`) on every board — that field can't be used to
+  tell them apart, which is why the script reads the ESP32's own MAC
+  instead, a genuine per-chip identifier. (Hub = the board with the
+  antenna; satellite = the board wired to the relay/pump — for when a
+  truly new/unknown board shows up and needs adding to the script.)
 - **Debugging without reliable serial access**: reading `/dev/ttyUSB*`
   programmatically (not via an interactive `pio device monitor` in a real
   terminal) was unreliable in this setup — reads intermittently returned
@@ -110,6 +118,20 @@ non-interactive/sandboxed shell).
   schedule-editing `<form>`s, so a poll can't discard an in-progress edit
   the way a naive full-page auto-refresh (e.g. `<meta http-equiv=refresh>`)
   would.
+- **"Already watered today" guard must reset when its schedule changes,
+  not just at midnight or reboot.** `lastWateredDayIndex[satellite][slot]`
+  is keyed by slot *number*, not by the slot's configured time. Found
+  2026-08-07: editing a slot's time-of-day after it had already fired
+  earlier that day (e.g. while calibrating a schedule, moving a time
+  around) left the guard still set from the old firing, silently
+  suppressing the new time for the rest of the day — looked exactly like
+  "the schedule randomly stops working," and a hub reboot "fixed" it only
+  because reboot resets the whole guard array. Fixed by resetting
+  `lastWateredDayIndex[idx][*]` inside `handleSatelliteSave()` — saving a
+  schedule always makes every slot eligible again today. General lesson:
+  any "did this already happen today" guard needs to be invalidated by
+  *both* the day rolling over *and* the underlying condition changing,
+  not just the former.
 
 ## Secrets & deployment-specific config
 
