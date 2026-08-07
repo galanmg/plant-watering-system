@@ -131,6 +131,48 @@ pump satellites — see Overview below; only 1 is built so far):
   firmware even booting) rather than relying on the USB-serial chip's own
   serial number, which turned out to be a non-unique factory default
   shared by every board of this model.
+- **Schedule slots: 5 per satellite, not 3** — raised after confirming the
+  3-slot version worked correctly (including the guard-reset fix, tested
+  with two back-to-back re-schedules on one slot). All 5 slots verified
+  firing correctly and in order in one run.
+- **Multi-day reliability hardening, 2026-08-07** — added after explicitly
+  reasoning through "what happens after this runs unattended for days,"
+  not just "does it work right now":
+  - **WiFi-drop detection**: previously `wifiConnected` was only ever set
+    once, at initial connection — if WiFi dropped *after* that (router
+    reboot, ISP hiccup, anything short of the hub itself losing power),
+    nothing would notice or retry, ever. Now polls `WiFi.status()` every
+    10s and resets the flag if it's no longer connected, letting the
+    existing retry-every-30s logic take back over. **Verified**: forced a
+    disconnect via a debug endpoint, confirmed the hub went unreachable,
+    confirmed it reconnected on its own with no reboot, and — the real
+    test — confirmed a *scheduled* watering fired correctly while WiFi
+    was still down, proving satellite control genuinely doesn't depend on
+    it, not just in theory.
+  - **Periodic NTP resync** every 6h even once already synced, as
+    insurance against the ESP32's internal clock drifting over a
+    multi-day/week trip (only synced once at boot before this).
+  - **Preventive daily reboot at 04:00** — clears any `String`-related
+    heap fragmentation from hours of page loads/status polls before it
+    can turn into an actual crash, rather than waiting to find out.
+    Skips itself (retries next cycle) if a satellite is mid-report, so it
+    can never cut off an active watering; guarded against re-triggering
+    itself immediately after rebooting (the "already rebooted today" flag
+    isn't persisted, so a boot landing back in the same minute needed an
+    explicit uptime floor).
+  - **Free heap exposed on the debug line** — the actual way to know if
+    fragmentation is real, by watching the number over days, rather than
+    guessing.
+  - Router SSID rename wasn't an option (ISP-locked), so added
+    `/debug/wifi-disconnect` — an unlinked endpoint that calls
+    `WiFi.disconnect()` to simulate the AP vanishing without touching the
+    router. Kept as a permanent manual test hook, not removed after use.
+  - **Not yet tested, only reasoned about**: actual day-rollover (does a
+    slot correctly re-arm after real midnight, not just same-day
+    re-scheduling), and heap behavior over many days rather than a few
+    test cycles. Both need real elapsed time, not a simulated shortcut —
+    the plan is a genuine multi-day soak test with a real schedule
+    configured, just letting time pass.
 
 ## Overview
 

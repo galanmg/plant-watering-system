@@ -2,9 +2,11 @@
 
 Status (2026-08-07): hub and one pump satellite built and flashed, running
 the real check-in/command/ack/report protocol, a persisted multi-satellite
-registry with per-slot (up to 3x/day) independent dosing, a live-updating
-web UI, and WiFi/power-outage resilience. See architecture.md's "Current
-implementation status" for what each one actually does today.
+registry with per-slot (up to 5x/day) independent dosing, a live-updating
+web UI, and hardening aimed specifically at multi-day unattended
+reliability (WiFi-drop detection, periodic resync, preventive daily
+reboot). See architecture.md's "Current implementation status" for what
+each one actually does today.
 
 ## Toolchain
 
@@ -132,6 +134,23 @@ non-interactive/sandboxed shell).
   any "did this already happen today" guard needs to be invalidated by
   *both* the day rolling over *and* the underlying condition changing,
   not just the former.
+- **A self-triggered scheduled reboot needs an uptime floor, not just a
+  "did this already happen today" flag.** The daily-reboot feature's
+  guard (`lastRebootDayIndex`) is a plain global, not persisted — it
+  resets to unset on *every* boot, including the reboot it just caused.
+  Boot + WiFi reconnect + NTP resync can plausibly complete in under a
+  minute, so without an explicit `millis() > 5 min` floor, a reboot that
+  happens to land back in the same target minute would immediately
+  trigger another one, forever. Any self-triggered periodic action needs
+  this same guard.
+- **Simulating network failure without router access**: renaming the
+  router's SSID isn't always possible (ISP-locked, in this case). Added
+  `/debug/wifi-disconnect` (calls `WiFi.disconnect()`) as a software-only
+  way to force exactly the same `WiFi.status() != WL_CONNECTED` condition
+  a real AP disappearance would cause — the hub can't tell the difference,
+  which is the point. Note the HTTP response to that request itself will
+  time out client-side (the disconnect happens mid-response), which is
+  expected, not a failure.
 
 ## Secrets & deployment-specific config
 

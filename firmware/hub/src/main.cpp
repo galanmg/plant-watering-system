@@ -44,13 +44,31 @@ unsigned long lastScheduleCheckMs = 0;
 // After a power cut, the router/modem often isn't back yet by the time
 // the hub reboots — these must never block satellite control or the web
 // server, just retry quietly in the background. See tryConnectWifi().
+// Also covers WiFi dropping *after* a successful connection (router
+// reboots/renames/etc. while the hub keeps running on mains power) — see
+// the periodic WiFi.status() check in loop().
 bool wifiConnected = false;
 unsigned long lastWifiAttemptMs = 0;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+unsigned long lastWifiStatusCheckMs = 0;
+const unsigned long WIFI_STATUS_CHECK_INTERVAL_MS = 10000;
 
 bool timeSynced = false;
 unsigned long lastTimeSyncAttemptMs = 0;
 const unsigned long TIME_SYNC_RETRY_INTERVAL_MS = 30000;
+// Defense against ESP32 clock drift over a multi-day/week trip — resync
+// periodically even once already synced, not just once at boot.
+unsigned long lastPeriodicResyncMs = 0;
+const unsigned long PERIODIC_RESYNC_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
+
+// Preventive daily reboot — clears any Arduino String heap fragmentation
+// from hours of page loads/status polls before it can turn into an
+// actual crash, rather than waiting to find out the hard way. 04:00 is
+// picked to avoid typical watering windows; also skipped for a cycle if
+// a satellite is mid-report, so it can never cut off an active watering.
+long lastRebootDayIndex = -1;
+const int REBOOT_HOUR = 4;
+const int REBOOT_MINUTE = 0;
 
 WebServer server(80);
 Preferences prefs;
@@ -99,18 +117,20 @@ struct PendingAck {
 // first free slot the moment its first check-in arrives; nothing here
 // requires the web UI to "add" one manually. ---
 const int MAX_SATELLITES = 4;
+const int SLOTS_PER_SATELLITE = 5;
 struct SatelliteConfig {
   bool inUse;
   uint8_t mac[6];
   char name[24];  // empty until renamed — falls back to "Satélite N"
-  bool slotEnabled[3];
-  uint8_t slotHour[3];
-  uint8_t slotMinute[3];
-  float slotDoseMl[3];  // independent per slot — more at night, less at
-                         // midday, etc., rather than one dose for all.
+  bool slotEnabled[SLOTS_PER_SATELLITE];
+  uint8_t slotHour[SLOTS_PER_SATELLITE];
+  uint8_t slotMinute[SLOTS_PER_SATELLITE];
+  float slotDoseMl[SLOTS_PER_SATELLITE];  // independent per slot — more at
+                                           // night, less at midday, etc.,
+                                           // rather than one dose for all.
 };
 SatelliteConfig satellites[MAX_SATELLITES];
-long lastWateredDayIndex[MAX_SATELLITES][3];
+long lastWateredDayIndex[MAX_SATELLITES][SLOTS_PER_SATELLITE];
 
 // Live status — not persisted, resets each boot (that's fine, it's
 // "am I hearing from it right now", not configuration).
@@ -241,7 +261,7 @@ int registerSatellite(const uint8_t *mac) {
       satellites[i].inUse = true;
       memcpy(satellites[i].mac, mac, 6);
       satellites[i].name[0] = '\0';
-      for (int s = 0; s < 3; s++) {
+      for (int s = 0; s < SLOTS_PER_SATELLITE; s++) {
         satellites[i].slotEnabled[s] = false;
         satellites[i].slotHour[s] = 23;
         satellites[i].slotMinute[s] = 0;
@@ -488,7 +508,7 @@ void renderSatellites(String &body) {
 
     int activeSlots = 0;
     float totalMl = 0;
-    for (int s = 0; s < 3; s++) {
+    for (int s = 0; s < SLOTS_PER_SATELLITE; s++) {
       if (satellites[i].slotEnabled[s]) {
         activeSlots++;
         totalMl += satellites[i].slotDoseMl[s];
@@ -501,7 +521,7 @@ void renderSatellites(String &body) {
     body += F("<details><summary>Editar horario</summary>");
     body += "<form action='/satellite/save' method='get'>";
     body += "<input type='hidden' name='idx' value='" + String(i) + "'>";
-    for (int s = 0; s < 3; s++) {
+    for (int s = 0; s < SLOTS_PER_SATELLITE; s++) {
       char timeVal[6];
       snprintf(timeVal, sizeof(timeVal), "%02d:%02d", satellites[i].slotHour[s],
                 satellites[i].slotMinute[s]);
@@ -613,8 +633,9 @@ void handleRoot() {
   body += "<details><summary>Debug ESP-NOW</summary><p class='sat-meta'>wifi=" +
           String(wifiConnected ? "ok" : "esperando") + " horaSync=" +
           String(timeSynced ? "ok" : "no") + " init=" +
-          String(debugEspNowInitOk ? "ok" : "FAIL") + " hubMac=" +
-          debugHubMac + " canal=" + String(WiFi.channel()) + " vistos=" +
+          String(debugEspNowInitOk ? "ok" : "FAIL") + " heap=" +
+          String(ESP.getFreeHeap()) + "B hubMac=" + debugHubMac +
+          " canal=" + String(WiFi.channel()) + " vistos=" +
           String(debugPacketsSeen) + " tipo=" + String(debugLastType) +
           " len=" + String(debugLastLen) + " remitente=" +
           (debugLastMac.length() ? debugLastMac : "-") + "</p></details>";
@@ -651,6 +672,18 @@ void handleRoot() {
 // it never disturbs an in-progress schedule edit. All the interpolated
 // text here is server-computed (numbers, fixed labels), never user input,
 // so no JSON escaping is needed.
+// Manual test hook: simulates the router vanishing (reboots, ISP hiccup,
+// etc.) without needing actual router access — same effect from the
+// hub's point of view as the AP disappearing, since it only ever looks
+// at WiFi.status(). Not linked from the UI, hit it directly when needed.
+void handleDebugWifiDisconnect() {
+  Serial.println("[debug] Forcing WiFi disconnect to simulate router loss");
+  WiFi.disconnect();
+  server.send(200, "text/plain",
+              "WiFi disconnected. Watch the debug line — should show "
+              "wifi=esperando within ~10s, then reconnect on its own.");
+}
+
 void handleStatusJson() {
   String json = "{\"satellites\":[";
   bool first = true;
@@ -690,7 +723,7 @@ void handleSatelliteRename() {
 void handleSatelliteSave() {
   int idx = server.arg("idx").toInt();
   if (idx >= 0 && idx < MAX_SATELLITES && satellites[idx].inUse) {
-    for (int s = 0; s < 3; s++) {
+    for (int s = 0; s < SLOTS_PER_SATELLITE; s++) {
       satellites[idx].slotEnabled[s] = server.hasArg("e" + String(s));
       String t = server.arg("t" + String(s));
       int h = satellites[idx].slotHour[s];
@@ -745,7 +778,7 @@ void setup() {
 
   loadSatelliteConfigs();
   for (int i = 0; i < MAX_SATELLITES; i++) {
-    for (int s = 0; s < 3; s++) lastWateredDayIndex[i][s] = -1;
+    for (int s = 0; s < SLOTS_PER_SATELLITE; s++) lastWateredDayIndex[i][s] = -1;
   }
 
   // ESP-NOW/satellite control must work independent of the home router —
@@ -767,6 +800,7 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/status.json", handleStatusJson);
+  server.on("/debug/wifi-disconnect", handleDebugWifiDisconnect);
   server.on("/satellite/rename", handleSatelliteRename);
   server.on("/satellite/save", handleSatelliteSave);
   server.on("/satellite/test", handleSatelliteTest);
@@ -798,6 +832,24 @@ void loop() {
     Serial.printf("Acked command #%u\n", pendingAcks[i].commandId);
   }
 
+  // Detects WiFi dropping *after* a successful connection — e.g. the
+  // router reboots, gets renamed, or otherwise vanishes while the hub
+  // stays powered. Without this, `wifiConnected` would stay stuck true
+  // forever (it's only ever set once, on initial connect) and the retry
+  // logic below would never fire again even though the link is actually
+  // down. Time keeps working regardless (the ESP32's own clock, once
+  // synced, doesn't depend on an active WiFi link), and ESP-NOW/satellite
+  // control was never gated on WiFi in the first place — this check only
+  // restores the *web page* and lets NTP resync once the network's back.
+  if (wifiConnected &&
+      nowMs - lastWifiStatusCheckMs >= WIFI_STATUS_CHECK_INTERVAL_MS) {
+    lastWifiStatusCheckMs = nowMs;
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiConnected = false;
+      Serial.println("WiFi connection lost — will retry in background");
+    }
+  }
+
   if (!wifiConnected && nowMs - lastWifiAttemptMs >= WIFI_RETRY_INTERVAL_MS) {
     lastWifiAttemptMs = nowMs;
     tryConnectWifi();
@@ -812,17 +864,61 @@ void loop() {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 10)) {
       timeSynced = true;
+      lastPeriodicResyncMs = nowMs;
       Serial.printf("Time synced: %02d:%02d:%02d\n", timeinfo.tm_hour,
                     timeinfo.tm_min, timeinfo.tm_sec);
+    }
+  }
+
+  // Periodic resync even once already synced — cheap insurance against
+  // the ESP32's internal clock drifting over a multi-day/week trip.
+  if (wifiConnected && timeSynced &&
+      nowMs - lastPeriodicResyncMs >= PERIODIC_RESYNC_INTERVAL_MS) {
+    lastPeriodicResyncMs = nowMs;
+    configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+    Serial.println("Periodic NTP resync");
+  }
+
+  // A report that never arrives (satellite gave up retrying after 5min)
+  // would otherwise leave this flag stuck true forever — harmless today
+  // since the status display already has its own timeout, but tidied up
+  // at the data level so the flag actually means what it says.
+  for (int i = 0; i < MAX_SATELLITES; i++) {
+    if (awaitingReport[i] &&
+        nowMs - commandSentMillis[i] > AWAITING_REPORT_DISPLAY_TIMEOUT_MS) {
+      awaitingReport[i] = false;
     }
   }
 
   if (nowMs - lastScheduleCheckMs >= SCHEDULE_CHECK_INTERVAL_MS) {
     lastScheduleCheckMs = nowMs;
     SimpleTime t = getCurrentTime();
+
+    // The uptime floor matters: lastRebootDayIndex resets to -1 on every
+    // boot (it's not persisted), so without it a reboot that happens to
+    // land back in the 04:00 minute (very plausible — boot+reconnect+
+    // resync can take under a minute) would immediately trigger another
+    // one, forever. 5 minutes safely clears any realistic boot time
+    // while staying far short of the ~24h real cadence.
+    if (millis() > 5UL * 60UL * 1000UL && t.hour == REBOOT_HOUR &&
+        t.minute == REBOOT_MINUTE && lastRebootDayIndex != t.dayIndex) {
+      bool anyAwaitingReport = false;
+      for (int i = 0; i < MAX_SATELLITES; i++) {
+        if (awaitingReport[i]) anyAwaitingReport = true;
+      }
+      if (anyAwaitingReport) {
+        Serial.println(
+            "Skipping scheduled reboot this cycle — satellite mid-report");
+      } else {
+        Serial.println("Scheduled daily reboot");
+        delay(100);  // let the serial line flush before restarting
+        ESP.restart();
+      }
+    }
+
     for (int i = 0; i < MAX_SATELLITES; i++) {
       if (!satellites[i].inUse) continue;
-      for (int s = 0; s < 3; s++) {
+      for (int s = 0; s < SLOTS_PER_SATELLITE; s++) {
         if (!satellites[i].slotEnabled[s]) continue;
         // Guard on dayIndex so the 1-minute match window can't fire
         // twice. Works even unsynced: dayIndex still advances once per
