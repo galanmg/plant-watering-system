@@ -63,24 +63,42 @@ only the power stage (below) differs.
 
 Confirmed working as of the first satellite build. Two separate power
 domains — the ESP32's own USB/logic supply, and the pump's 5V feed —
-tied together only by a shared ground, never by a shared supply line:
+share a ground, never a supply line. **Every wire below is a literal,
+physical connection to make — none of them are implied by another one.**
+An earlier version of this doc drew the ground connections as an
+abstract "shared node" bracket in a schematic, which cost real
+troubleshooting time: it looked like a diagramming convention rather
+than an instruction to run an actual wire, so wire 3 below got skipped.
+
+| # | From | To |
+|---|---|---|
+| 1 | ESP32 `GPIO26` | Relay `IN` |
+| 2 | ESP32 `GND` | Relay `DC-` |
+| 3 | Relay `DC-` | 5V supply `GND` (black) — **easy to miss, check this first if the relay never clicks** |
+| 4 | 5V supply `+5V` (red) | Relay `DC+` |
+| 5 | 5V supply `+5V` (red) | Relay `COM` |
+| 6 | 5V supply `GND` (black) | Pump `−` |
+| 7 | Relay `NO` | Pump `+` |
+
+Why wire 3 matters: the relay's coil is powered by `DC+`/`DC-` (wires 3
+and 4), sourced from the 5V supply. Without wire 3, that coil circuit has
+no return path back to the supply — it's an open loop — so the relay
+never energizes no matter what the GPIO does, even though every other
+wire looks correct.
 
 ```
-SIGNAL SIDE — low voltage, from the ESP32 satellite board
-────────────────────────────────────────────────────────────
-  ESP32 GPIO26 ────────────────────────► Relay IN
-  ESP32 GND    ────────────────────────► Relay DC- ──┐
-                                                       │  shared
-POWER SIDE — 5V feed (e.g. a cut phone-charger cable) │  ground
-────────────────────────────────────────────────────  │  node
-  5V supply  +  (red)   ──┬──────────►  Relay DC+     │
-                          └──────────►  Relay COM     │
-  5V supply  GND (black) ───────────────────────────────┘
-                          │
-                          └──────────►  Pump  −
+  ESP32 GPIO26 ──────────────────────────► Relay IN
 
-  Relay NO ─────────────────────────────────────────► Pump  +
-  Relay NC ─────────────────────────────────────────► (unused)
+  ESP32 GND ──────┬─────────────────────► Relay DC-
+                   │
+  5V supply GND ───┴─────────────────────► Pump −
+  (black)          (wire 3: DC- and 5V-GND are directly tied together)
+
+  5V supply +5V ──┬───────────────────────► Relay DC+
+  (red)           └───────────────────────► Relay COM
+
+  Relay NO ───────────────────────────────► Pump +
+  Relay NC ───────────────────────────────► (unused)
 ```
 
 Trigger polarity is **active-HIGH** on the specific relay module in use
