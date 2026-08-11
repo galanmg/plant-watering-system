@@ -1,12 +1,14 @@
 # Firmware
 
-Status (2026-08-07): hub and one pump satellite built and flashed, running
-the real check-in/command/ack/report protocol, a persisted multi-satellite
-registry with per-slot (up to 5x/day) independent dosing, a live-updating
-web UI, and hardening aimed specifically at multi-day unattended
-reliability (WiFi-drop detection, periodic resync, preventive daily
-reboot). See architecture.md's "Current implementation status" for what
-each one actually does today.
+Status (2026-08-11): all 3 pump satellites flashed and proven checking in
+concurrently (only #1 has a physical pump wired so far). 4-day soak test
+of a real hourly schedule confirmed day-rollover re-arming works, not just
+same-day. Hub runs the real check-in/command/ack/report protocol, a
+persisted multi-satellite registry with per-slot (up to 5x/day)
+independent dosing, a live-updating web UI, and hardening aimed
+specifically at multi-day unattended reliability (WiFi-drop detection,
+periodic resync, preventive daily reboot). See architecture.md's "Current
+implementation status" for what each one actually does today.
 
 ## Toolchain
 
@@ -151,6 +153,23 @@ non-interactive/sandboxed shell).
   which is the point. Note the HTTP response to that request itself will
   time out client-side (the disconnect happens mid-response), which is
   expected, not a failure.
+- **`scripts/identify-boards.sh` needed `|| true` on the per-port
+  esptool call.** Under `set -e -o pipefail`, one board hitting a
+  transient read failure (seen in practice right after boards enumerate,
+  before the OS has the port fully ready) aborted checking the *other*
+  ports too, not just that one — silent exit code 1, no useful output.
+  General lesson for any per-item loop under `set -e`: a single item's
+  expected-to-sometimes-fail command needs its own `|| true`, or one
+  flaky item kills the whole batch.
+- **More concurrent satellites = more ESP-NOW channel contention than
+  you'd guess from testing with one.** Confirmed 2026-08-11 with 3
+  satellites running at once: brief check-in misses got noticeably more
+  frequent (still always self-recovering) purely from sharing the
+  channel, not any code issue. `SATELLITE_OFFLINE_MS` (grey-status
+  threshold) had to widen from 20000 to 35000 to stop that showing up as
+  UI flicker. Actual watering wasn't at risk — the retry logic already
+  covers this — but the *status display* threshold was tuned for 1
+  satellite's baseline miss rate, not N of them.
 
 ## Secrets & deployment-specific config
 

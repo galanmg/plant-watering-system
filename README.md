@@ -24,16 +24,17 @@ the plants. They wither.
 
 v1 target: 1 hub + 2 pump satellites, working before early September 2026
 (see [docs/architecture.md](docs/architecture.md)'s Overview). As of
-2026-08-07: the hub runs a real live-updating web control panel — a
+2026-08-11: the hub runs a real live-updating web control panel — a
 persisted, multi-satellite registry, per-slot (up to 5x/day) independent
 scheduling with its own dose per slot, manual test/water controls, and a
-confirmed command/report/ack protocol with retries. The first pump
-satellite is fully working end to end; a real WiFi-drop scenario (router
-vanishes, electricity never lost) was deliberately tested and confirmed a
-scheduled watering still fires while the hub is unreachable. A genuine
-multi-day soak test is now the open question — see
-docs/architecture.md's "Current implementation status" for the full
-writeup, and [docs/firmware.md](docs/firmware.md) for how to build/flash.
+confirmed command/report/ack protocol with retries. A 4-day soak test
+confirmed the schedule keeps firing correctly across real day
+boundaries, not just same-day. All 3 pump satellites are now flashed and
+proven checking in concurrently (only #1 has a physical pump wired so
+far) — found and fixed a real multi-satellite radio-contention effect
+along the way. See docs/architecture.md's "Current implementation
+status" for the full writeup, and [docs/firmware.md](docs/firmware.md)
+for how to build/flash.
 
 ## Roadmap
 
@@ -54,10 +55,12 @@ writeup, and [docs/firmware.md](docs/firmware.md) for how to build/flash.
    - [x] Multi-day reliability hardening: WiFi-drop detection + auto-
          recovery (tested live, including a scheduled watering firing
          mid-outage), periodic NTP resync, preventive daily reboot
-   - [ ] Genuine multi-day soak test (day-rollover re-arming, heap over
-         time — both reasoned through, neither actually observed yet)
-   - [ ] Clone the proven satellite build onto the second pump satellite
-         board
+   - [x] Genuine multi-day soak test — 4 days, real schedule, confirmed
+         day-rollover re-arming works
+   - [x] Second and third satellite boards flashed, proven checking in
+         concurrently with no hub instability
+   - [ ] Wire relay/pump onto satellite #2 (v1 needs 2 watering
+         satellites; #3 is a spare/future board for now)
    - [ ] Volume tracking + oversized-reservoir dry-run safety net
 2. **Post-v1** — monitor satellite (float switch), INA219 dry-run current
    sensing, status LED panel, remote access (outbound relay).

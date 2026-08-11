@@ -9,7 +9,7 @@ to-do list. See [project-overview.md](project-overview.md) for the
 decision log and step checklist, and [hardware.md](hardware.md) for the
 shopping list and purchase status.
 
-Last updated: 2026-08-07
+Last updated: 2026-08-11
 
 ## Current implementation status
 
@@ -167,12 +167,33 @@ pump satellites — see Overview below; only 1 is built so far):
     `/debug/wifi-disconnect` — an unlinked endpoint that calls
     `WiFi.disconnect()` to simulate the AP vanishing without touching the
     router. Kept as a permanent manual test hook, not removed after use.
-  - **Not yet tested, only reasoned about**: actual day-rollover (does a
-    slot correctly re-arm after real midnight, not just same-day
-    re-scheduling), and heap behavior over many days rather than a few
-    test cycles. Both need real elapsed time, not a simulated shortcut —
-    the plan is a genuine multi-day soak test with a real schedule
-    configured, just letting time pass.
+- **Multi-day soak test, 2026-08-07 → 2026-08-11**: ran a real 5-slot
+  hourly schedule (18:00–22:00, 75mL each) on satellite #1 continuously
+  for 4 days with no intervention. Confirmed working when checked back on
+  2026-08-11 — day-rollover re-arming (the thing the guard-reset bug
+  specifically threatened) held up correctly across multiple real
+  midnights, not just the same-day re-scheduling tested at the time of
+  the fix.
+- **Second and third pump satellites flashed and proven, 2026-08-11** —
+  same firmware image as satellite #1 (no per-board config beyond the
+  shared `config.h`), each auto-registers into its own registry slot on
+  first check-in with no manual "add" step. Bare boards for now, no
+  relay/pump wired (only satellite #1 has the physical pump setup) — this
+  round was specifically about proving multi-satellite *behavior*, not
+  physical watering on #2/#3 yet. With all 3 running concurrently on
+  independent power (not tethered to the flashing PC):
+  - Hub stayed fully responsive throughout — no hangs, registry correctly
+    keeps each satellite's status/history separate.
+  - Found a real, previously-unobserved effect: 3 satellites sharing one
+    ESP-NOW channel produces noticeably more frequent brief check-in
+    misses than 1 satellite alone (radio contention, not a bug) — each
+    always self-recovered within a cycle, but was visible as a rotating
+    "Sin conexión" flicker across satellites. `SATELLITE_OFFLINE_MS`
+    widened from 20000 to 35000 (from ~4 to ~7 missed check-ins of
+    slack) to absorb this without meaningfully delaying real-offline
+    detection. Actual watering reliability was never at risk from this —
+    the command/report retry logic was already designed to absorb
+    exactly this class of packet loss.
 
 ## Overview
 

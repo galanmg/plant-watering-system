@@ -22,9 +22,13 @@ const int WIFI_CHANNEL = 1;
 
 const unsigned long SCHEDULE_CHECK_INTERVAL_MS = 30000;
 // A satellite that hasn't checked in within this window shows offline
-// (grey) rather than online (green) — a few missed 5s check-ins' worth of
-// slack, since individual ESP-NOW sends occasionally just don't land.
-const unsigned long SATELLITE_OFFLINE_MS = 20000;
+// (grey) rather than online (green) — slack for missed 5s check-ins,
+// since individual ESP-NOW sends occasionally just don't land. Widened
+// 2026-08-11 after confirming with 3 satellites running concurrently
+// that channel contention makes brief misses more frequent than with
+// just one — was 20000 (4 missed check-ins), still real but false-flicker
+// prone at that count once multiple satellites share the channel.
+const unsigned long SATELLITE_OFFLINE_MS = 35000;
 
 // Measured 2026-08-06: 125mL over a 10s run (tube pre-primed), through
 // ~80cm of tubing/head — matches the real deployment geometry, not a

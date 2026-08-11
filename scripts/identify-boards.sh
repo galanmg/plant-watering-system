@@ -22,6 +22,7 @@ HUB_MAC="68:09:47:9e:8a:60"
 declare -A KNOWN_BOARDS=(
   ["$HUB_MAC"]="hub (antenna board)"
   ["8c:94:df:4d:24:00"]="pump-satellite #1 (relay/pump board)"
+  ["30:76:f5:92:44:f4"]="pump-satellite #2 (bare, no relay/pump wired yet)"
 )
 
 if [ -z "$PIO_PY" ]; then
@@ -37,10 +38,15 @@ if [ ${#ports[@]} -eq 0 ]; then
 fi
 
 for port in "${ports[@]}"; do
+  # `|| true` matters here: under `set -e -o pipefail`, a transient
+  # esptool failure on *one* port (e.g. right after boards enumerate,
+  # before the OS has the device fully ready) would otherwise abort the
+  # whole script before checking the remaining ports. Seen in practice,
+  # not hypothetical — a rerun moments later succeeded cleanly.
   mac=$("$PIO_PY" "$ESPTOOL" --port "$port" read_mac 2>/dev/null \
-    | grep -oE "([0-9a-f]{2}:){5}[0-9a-f]{2}" | head -1)
+    | grep -oE "([0-9a-f]{2}:){5}[0-9a-f]{2}" | head -1 || true)
   if [ -z "$mac" ]; then
-    echo "$port -> could not read (board unplugged mid-check, or in use?)"
+    echo "$port -> could not read (transient failure, or board busy/unplugged — try again)"
     continue
   fi
   label="${KNOWN_BOARDS[$mac]:-unknown board}"
