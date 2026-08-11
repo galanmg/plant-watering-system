@@ -59,6 +59,37 @@ only the power stage (below) differs.
 | INA219 current/voltage sensor (I2C) | Inline with the pump's power feed. Lets the satellite tell the hub "commanded on, but drew ~0mA" (pump unplugged/dead) vs. "drew expected current" (working). This is the concrete answer to the open "what does pump detected mean" question — current sensing, not just a heartbeat. Also a secondary diagnostic for faults the reservoir monitor's float switch can't catch (e.g. clogged tubing). **Not yet installed** — the first satellite build proved relay+pump control only; dry-run current sensing is still open, see firmware TODOs. |
 | Reserved I2C header pads | Not populated yet — for the Phase 2 humidity/temperature sensor (e.g. SHT31). Leaving the header now avoids a board respin later. |
 
+### Pump satellite wiring (relay + pump)
+
+Confirmed working as of the first satellite build. Two separate power
+domains — the ESP32's own USB/logic supply, and the pump's 5V feed —
+tied together only by a shared ground, never by a shared supply line:
+
+```
+SIGNAL SIDE — low voltage, from the ESP32 satellite board
+────────────────────────────────────────────────────────────
+  ESP32 GPIO26 ────────────────────────► Relay IN
+  ESP32 GND    ────────────────────────► Relay DC- ──┐
+                                                       │  shared
+POWER SIDE — 5V feed (e.g. a cut phone-charger cable) │  ground
+────────────────────────────────────────────────────  │  node
+  5V supply  +  (red)   ──┬──────────►  Relay DC+     │
+                          └──────────►  Relay COM     │
+  5V supply  GND (black) ───────────────────────────────┘
+                          │
+                          └──────────►  Pump  −
+
+  Relay NO ─────────────────────────────────────────► Pump  +
+  Relay NC ─────────────────────────────────────────► (unused)
+```
+
+Trigger polarity is **active-HIGH** on the specific relay module in use
+(GTIWUNG 5V, opto-isolated) — GPIO `HIGH` energizes the relay and
+connects `COM`↔`NO`, powering the pump. `LOW` (the idle/boot default) is
+fail-safe: pump disconnected. This was empirically confirmed, not
+assumed — re-verify if a different relay module brand is ever swapped in
+(see the table above).
+
 Note: no float switch on the pump satellite itself — reservoirs are shared
 across satellites, so level sensing lives on a separate **monitor
 satellite** instead (below), one per physical container.
